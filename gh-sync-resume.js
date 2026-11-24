@@ -14,9 +14,12 @@
         DEFAULT_FILE_PATH: 'lampa-sync.json',
         STATE_VERSION: 1,
         MAX_CONFLICT_RETRIES: 2,
-        SYNC_DEBOUNCE_MS: 12000,
+        PLAYBACK_SYNC_DEBOUNCE_MS: 8000,
+        IMMEDIATE_SYNC_DELAY_MS: 600,
+        PULL_THROTTLE_MS: 12000,
         MUTATION_DEBOUNCE_MS: 220,
         ORCHESTRATOR_TIMEOUT_MS: 18000,
+        ORCHESTRATOR_STEP_DELAY_MS: 450,
         PLAYBACK_ARM_TIMEOUT_MS: 20000,
         MIN_RESUME_SECONDS: 3,
         BASE64_CHUNK_SIZE: 32768
@@ -30,6 +33,7 @@
         AUTO_SYNC: 'gh_sync_auto',
         META: 'gh_sync_local_meta',
         RESUMES: 'gh_sync_local_resumes',
+        LAST_STATUS: 'gh_sync_last_status',
         FILE_VIEW: 'file_view'
     };
 
@@ -61,7 +65,10 @@
         syncInProgress: false,
         syncQueued: false,
         syncDebounceTimer: null,
+        lastPullTimestamp: 0,
         isApplyingRemote: false,
+        originalTimelineUpdate: null,
+        lastFileViewSnapshot: {},
         activeObserver: null,
         mutationDebounceTimer: null,
         activePlayContext: null,
@@ -74,7 +81,8 @@
             attemptedSeason: false,
             attemptedVoice: false,
             pendingFilterSubmenu: null,
-            timerId: null
+            timerId: null,
+            stepTimerId: null
         }
     };
 
@@ -128,6 +136,14 @@
         return pad(minutes) + ':' + pad(seconds);
     }
 
+    function formatClockTime(timestamp) {
+        const date = new Date(timestamp || Date.now());
+        const pad = function (num) {
+            return num < 10 ? '0' + num : String(num);
+        };
+        return pad(date.getHours()) + ':' + pad(date.getMinutes()) + ':' + pad(date.getSeconds());
+    }
+
     function padEpisodeNumber(value) {
         const num = Number(value) || 0;
         return num < 10 ? '0' + num : String(num);
@@ -150,6 +166,10 @@
             return raw;
         }
         return {};
+    }
+
+    function setLastSyncStatus(text) {
+        Lampa.Storage.set(STORAGE_KEYS.LAST_STATUS, formatClockTime(Date.now()) + ' — ' + String(text || ''));
     }
 
     function getSyncCredentials() {
@@ -191,17 +211,17 @@
         if (!hash || !entry || typeof entry !== 'object') {
             return null;
         }
-        const time = Math.max(0, Number(entry.time) || 0);
-        const duration = Math.max(0, Number(entry.duration) || 0);
-        let percent = Math.max(0, Math.min(100, Number(entry.percent) || 0));
+        const time = Math.max(0, Math.floor(Number(entry.time) || 0));
+        const duration = Math.max(0, Math.floor(Number(entry.duration) || 0));
+        let percent = Math.max(0, Math.min(100, Math.round(Number(entry.percent) || 0)));
         if (percent === 0 && duration > 0 && time > 0) {
             percent = Math.min(100, Math.round((time / duration) * 100));
         }
         const updatedAt = Number(entry.updatedAt) || Number(fallbackTimestamp) || 0;
         return {
             hash: String(hash),
-            time: Math.floor(time),
-            duration: Math.floor(duration),
+            time: time,
+            duration: duration,
             percent: percent,
             updatedAt: updatedAt
         };
@@ -213,7 +233,7 @@
         }
         const time = Math.max(0, Math.floor(Number(entry.time) || 0));
         const duration = Math.max(0, Math.floor(Number(entry.duration) || 0));
-        let percent = Math.max(0, Math.min(100, Number(entry.percent) || 0));
+        let percent = Math.max(0, Math.min(100, Math.round(Number(entry.percent) || 0)));
         if (percent === 0 && duration > 0 && time > 0) {
             percent = Math.min(100, Math.round((time / duration) * 100));
         }
@@ -233,6 +253,66 @@
             percent: percent,
             updatedAt: Number(entry.updatedAt) || 0
         };
+    }
+
+    function cloneFileViewSnapshot(fileView) {
+        const snapshot = {};
+        if (!fileView || typeof fileView !== 'object') {
+            return snapshot;
+        }
+        Object.keys(fileView).forEach(function (hash) {
+            const entry = fileView[hash];
+            if (!entry || typeof entry !== 'object') {
+                return;
+            }
+            snapshot[hash] = {
+                time: Math.max(0, Math.floor(Number(entry.time) || 0)),
+                duration: Math.max(0, Math.floor(Number(entry.duration) || 0)),
+                percent: Math.max(0, Math.min(100, Math.round(Number(entry.percent) || 0)))
+            };
+        });
+        return snapshot;
+    }
+
+    function readLiveTimelineByHash(hash) {
+        if (!hash) {
+            return null;
+        }
+        const fileView = getSafeObjectStorage(STORAGE_KEYS.FILE_VIEW);
+        const fromStorage = normalizeTimelineEntry(hash, fileView[hash], 0);
+        let fromApi = null;
+        if (Lampa.Timeline && typeof Lampa.Timeline.view === 'function') {
+            try {
+                fromApi = normalizeTimelineEntry(hash, Lampa.Timeline.view(hash), 0);
+            } catch (err) {
+                console.error('[GH Sync] Timeline.view failed', err);
+            }
+        }
+        if (fromStorage && fromApi) {
+            return fromStorage.time >= fromApi.time ? fromStorage : fromApi;
+        }
+        return fromStorage || fromApi;
+    }
+
+    function hydrateResumeWithLiveTimeline(resume) {
+        if (!resume || !resume.timelineHash) {
+            return resume;
+        }
+        const live = readLiveTimelineByHash(resume.timelineHash);
+        if (!live || (live.time < CONFIG.MIN_RESUME_SECONDS && live.percent === 0)) {
+            return resume;
+        }
+        const meta = getSafeObjectStorage(STORAGE_KEYS.META);
+        const liveUpdatedAt = Number(meta[resume.timelineHash]) || 0;
+        if (resume.time < CONFIG.MIN_RESUME_SECONDS || liveUpdatedAt >= resume.updatedAt || live.time > resume.time) {
+            return Object.assign({}, resume, {
+                time: live.time,
+                duration: live.duration || resume.duration,
+                percent: live.percent || resume.percent,
+                updatedAt: Math.max(resume.updatedAt, liveUpdatedAt)
+            });
+        }
+        return resume;
     }
 
     function buildLocalStateSnapshot() {
@@ -258,9 +338,10 @@
             if (!normalized) {
                 return;
             }
-            state.resumes[movieKey] = normalized;
-            if (normalized.updatedAt > maxTimestamp) {
-                maxTimestamp = normalized.updatedAt;
+            const hydrated = hydrateResumeWithLiveTimeline(normalized);
+            state.resumes[movieKey] = hydrated;
+            if (hydrated.updatedAt > maxTimestamp) {
+                maxTimestamp = hydrated.updatedAt;
             }
         });
 
@@ -281,7 +362,10 @@
         if (localEntry.updatedAt > remoteEntry.updatedAt) {
             return localEntry;
         }
-        if (remoteEntry.percent > localEntry.percent || remoteEntry.time > localEntry.time) {
+        if (remoteEntry.time !== localEntry.time) {
+            return remoteEntry.time > localEntry.time ? remoteEntry : localEntry;
+        }
+        if (remoteEntry.percent > localEntry.percent) {
             return remoteEntry;
         }
         return localEntry;
@@ -305,6 +389,7 @@
 
     function mergeSyncStates(localState, remoteState) {
         const merged = createEmptyState();
+        const changedTimelineHashes = [];
         let remoteNeedsUpdate = false;
         let localNeedsUpdate = false;
         let maxTimestamp = 0;
@@ -321,11 +406,23 @@
             if (winner.updatedAt > maxTimestamp) {
                 maxTimestamp = winner.updatedAt;
             }
-            if (!remoteEntry || remoteEntry.time !== winner.time || remoteEntry.percent !== winner.percent || remoteEntry.updatedAt !== winner.updatedAt) {
+            if (
+                !remoteEntry ||
+                remoteEntry.time !== winner.time ||
+                remoteEntry.duration !== winner.duration ||
+                remoteEntry.percent !== winner.percent ||
+                remoteEntry.updatedAt !== winner.updatedAt
+            ) {
                 remoteNeedsUpdate = true;
             }
-            if (!localEntry || localEntry.time !== winner.time || localEntry.percent !== winner.percent) {
+            if (
+                !localEntry ||
+                localEntry.time !== winner.time ||
+                localEntry.duration !== winner.duration ||
+                localEntry.percent !== winner.percent
+            ) {
                 localNeedsUpdate = true;
+                changedTimelineHashes.push(hash);
             }
         });
 
@@ -336,6 +433,15 @@
             const winner = pickNewerResume(localEntry, remoteEntry);
             if (!winner) {
                 return;
+            }
+            if (winner.timelineHash && merged.timelines[winner.timelineHash]) {
+                const matchedTimeline = merged.timelines[winner.timelineHash];
+                if (matchedTimeline.updatedAt >= winner.updatedAt || (winner.time < CONFIG.MIN_RESUME_SECONDS && matchedTimeline.time > 0)) {
+                    winner.time = matchedTimeline.time;
+                    winner.duration = matchedTimeline.duration || winner.duration;
+                    winner.percent = matchedTimeline.percent || winner.percent;
+                    winner.updatedAt = Math.max(winner.updatedAt, matchedTimeline.updatedAt);
+                }
             }
             merged.resumes[movieKey] = winner;
             if (winner.updatedAt > maxTimestamp) {
@@ -352,12 +458,13 @@
         merged.updatedAt = maxTimestamp || Date.now();
         return {
             mergedState: merged,
+            changedTimelineHashes: changedTimelineHashes,
             remoteNeedsUpdate: remoteNeedsUpdate,
             localNeedsUpdate: localNeedsUpdate
         };
     }
 
-    function applyMergedStateLocally(mergedState) {
+    function applyMergedStateLocally(mergedState, changedTimelineHashes) {
         runtime.isApplyingRemote = true;
         try {
             const fileView = getSafeObjectStorage(STORAGE_KEYS.FILE_VIEW);
@@ -372,19 +479,33 @@
                     percent: entry.percent
                 };
                 localMeta[hash] = entry.updatedAt;
-                if (Lampa.Timeline && typeof Lampa.Timeline.update === 'function') {
-                    Lampa.Timeline.update({
-                        hash: entry.hash,
-                        time: entry.time,
-                        duration: entry.duration,
-                        percent: entry.percent
-                    });
-                }
             });
 
             Lampa.Storage.set(STORAGE_KEYS.FILE_VIEW, fileView);
             Lampa.Storage.set(STORAGE_KEYS.META, localMeta);
             Lampa.Storage.set(STORAGE_KEYS.RESUMES, mergedState.resumes);
+
+            const updateFn = runtime.originalTimelineUpdate || (Lampa.Timeline && typeof Lampa.Timeline.update === 'function' ? Lampa.Timeline.update.bind(Lampa.Timeline) : null);
+            if (updateFn && Array.isArray(changedTimelineHashes)) {
+                changedTimelineHashes.forEach(function (hash) {
+                    const entry = mergedState.timelines[hash];
+                    if (!entry) {
+                        return;
+                    }
+                    try {
+                        updateFn({
+                            hash: entry.hash,
+                            time: entry.time,
+                            duration: entry.duration,
+                            percent: entry.percent
+                        });
+                    } catch (err) {
+                        console.error('[GH Sync] Timeline apply failed', err);
+                    }
+                });
+            }
+
+            runtime.lastFileViewSnapshot = cloneFileViewSnapshot(getSafeObjectStorage(STORAGE_KEYS.FILE_VIEW));
         } finally {
             runtime.isApplyingRemote = false;
         }
@@ -489,6 +610,7 @@
 
         runtime.syncInProgress = true;
         try {
+            reconcileLocalFileViewDiff(false);
             let attempt = 0;
             while (attempt <= CONFIG.MAX_CONFLICT_RETRIES) {
                 attempt += 1;
@@ -498,7 +620,7 @@
                     const result = mergeSyncStates(localState, remote.state);
 
                     if (result.localNeedsUpdate) {
-                        applyMergedStateLocally(result.mergedState);
+                        applyMergedStateLocally(result.mergedState, result.changedTimelineHashes);
                         refreshCurrentResumeBar();
                     }
 
@@ -506,9 +628,12 @@
                         await pushRemoteFile(creds, result.mergedState, remote.sha);
                     }
 
+                    runtime.lastPullTimestamp = Date.now();
+                    const timelineCount = Object.keys(result.mergedState.timelines).length;
+                    const resumeCount = Object.keys(result.mergedState.resumes).length;
+                    setLastSyncStatus('OK (таймкоды: ' + timelineCount + ', позиции: ' + resumeCount + ')');
+
                     if (notify) {
-                        const resumeCount = Object.keys(result.mergedState.resumes).length;
-                        const timelineCount = Object.keys(result.mergedState.timelines).length;
                         Lampa.Noty.show('GitHub Sync: синхронизировано (таймкоды: ' + timelineCount + ', позиции: ' + resumeCount + ')');
                     }
                     return true;
@@ -522,30 +647,43 @@
             return false;
         } catch (error) {
             console.error('[GH Sync] Sync failed', error);
+            const message = error && error.message ? error.message : 'нет связи';
+            setLastSyncStatus('Ошибка: ' + message);
             if (notify) {
-                Lampa.Noty.show('GitHub Sync ошибка: ' + (error && error.message ? error.message : 'нет связи'));
+                Lampa.Noty.show('GitHub Sync ошибка: ' + message);
             }
             return false;
         } finally {
             runtime.syncInProgress = false;
             if (runtime.syncQueued) {
                 runtime.syncQueued = false;
-                scheduleDebouncedSync();
+                scheduleDebouncedSync(CONFIG.IMMEDIATE_SYNC_DELAY_MS);
             }
         }
     }
 
-    function scheduleDebouncedSync() {
+    function scheduleDebouncedSync(delayMs) {
         if (!isAutoSyncEnabled() || !getSyncCredentials().isValid) {
             return;
         }
+        const effectiveDelay = typeof delayMs === 'number' ? delayMs : CONFIG.PLAYBACK_SYNC_DEBOUNCE_MS;
         if (runtime.syncDebounceTimer) {
             clearTimeout(runtime.syncDebounceTimer);
         }
         runtime.syncDebounceTimer = setTimeout(function () {
             runtime.syncDebounceTimer = null;
             executeSync({ notify: false });
-        }, CONFIG.SYNC_DEBOUNCE_MS);
+        }, effectiveDelay);
+    }
+
+    function triggerThrottledPullSync() {
+        if (!isAutoSyncEnabled() || !getSyncCredentials().isValid || runtime.syncInProgress) {
+            return;
+        }
+        if (Date.now() - runtime.lastPullTimestamp < CONFIG.PULL_THROTTLE_MS) {
+            return;
+        }
+        executeSync({ notify: false });
     }
 
     async function testGitHubConnection() {
@@ -621,6 +759,58 @@
         return rendered[0] || rendered;
     }
 
+    function isInsideSidebarOrFilter(element) {
+        if (!element || typeof element.closest !== 'function') {
+            return true;
+        }
+        return Boolean(
+            element.closest('.filter') ||
+            element.closest('.explorer-card') ||
+            element.closest('.explorer__left') ||
+            element.closest('.files__left') ||
+            element.closest('.' + CSS_CLASSES.BAR)
+        );
+    }
+
+    function getEpisodeCards(root) {
+        if (!root) {
+            return [];
+        }
+        const raw = root.querySelectorAll('.online-prestige, .online');
+        const cards = [];
+        for (let i = 0; i < raw.length; i++) {
+            const el = raw[i];
+            if (el.classList.contains(CSS_CLASSES.BAR)) {
+                continue;
+            }
+            if (!el.classList.contains('selector')) {
+                continue;
+            }
+            if (isInsideSidebarOrFilter(el)) {
+                continue;
+            }
+            cards.push(el);
+        }
+        return cards;
+    }
+
+    function findFallbackEpisodeScrollBody(root) {
+        if (!root) {
+            return null;
+        }
+        const preferred = root.querySelector('.files__body .scroll__body, .explorer__files-body .scroll__body');
+        if (preferred && !isInsideSidebarOrFilter(preferred)) {
+            return preferred;
+        }
+        const bodies = root.querySelectorAll('.scroll__body');
+        for (let i = 0; i < bodies.length; i++) {
+            if (!isInsideSidebarOrFilter(bodies[i])) {
+                return bodies[i];
+            }
+        }
+        return null;
+    }
+
     function findFilterButtonByKeywords(root, primaryClass, keywords) {
         if (!root) {
             return null;
@@ -656,22 +846,6 @@
         return '';
     }
 
-    function readCurrentDomContext(root) {
-        const sourceButton = findFilterButtonByKeywords(root, 'filter--sort', ['источник', 'балансер', 'source']);
-        const filterButton = findFilterButtonByKeywords(root, 'filter--filter', ['фильтр', 'filter', 'озвуч', 'сезон']);
-        const source = readFilterButtonValue(sourceButton);
-        const filterText = readFilterButtonValue(filterButton);
-        const parsedFilter = parseFilterSummary(filterText);
-        return {
-            source: source,
-            season: parsedFilter.season,
-            voice: parsedFilter.voice,
-            rawFilter: filterText,
-            sourceButton: sourceButton,
-            filterButton: filterButton
-        };
-    }
-
     function parseFilterSummary(filterText) {
         const result = { season: 0, voice: '' };
         if (!filterText) {
@@ -694,6 +868,22 @@
         return result;
     }
 
+    function readCurrentDomContext(root) {
+        const sourceButton = findFilterButtonByKeywords(root, 'filter--sort', ['источник', 'балансер', 'source']);
+        const filterButton = findFilterButtonByKeywords(root, 'filter--filter', ['фильтр', 'filter', 'озвуч', 'сезон']);
+        const source = readFilterButtonValue(sourceButton);
+        const filterText = readFilterButtonValue(filterButton);
+        const parsedFilter = parseFilterSummary(filterText);
+        return {
+            source: source,
+            season: parsedFilter.season,
+            voice: parsedFilter.voice,
+            rawFilter: filterText,
+            sourceButton: sourceButton,
+            filterButton: filterButton
+        };
+    }
+
     function parseSeasonEpisodeFromText(text) {
         const str = String(text || '');
         let season = 0;
@@ -712,6 +902,29 @@
             episode = Number(episodeMatch[1]) || 0;
         }
         return { season: season, episode: episode };
+    }
+
+    function extractEpisodeNumberFromCard(card) {
+        if (!card) {
+            return 0;
+        }
+        const numNode = card.querySelector('.online-prestige__episode-number, .online__episode-number, .online-prestige__num, .online-prestige__img div');
+        if (numNode && numNode.textContent) {
+            const digits = String(numNode.textContent).replace(/\D+/g, '');
+            if (digits) {
+                return Number(digits) || 0;
+            }
+        }
+        const trimmed = String(card.textContent || '').trim();
+        const parsed = parseSeasonEpisodeFromText(trimmed);
+        if (parsed.episode > 0) {
+            return parsed.episode;
+        }
+        const leadingMatch = trimmed.match(/^0*(\d{1,3})(?:\s|\.|\-|$)/);
+        if (leadingMatch) {
+            return Number(leadingMatch[1]) || 0;
+        }
+        return 0;
     }
 
     function detectQualityLabel(playData) {
@@ -767,6 +980,109 @@
         Lampa.Storage.set(STORAGE_KEYS.META, meta);
     }
 
+    function applyTimelineChangeToResumes(hash, time, duration, percent, now) {
+        const resumes = getSafeObjectStorage(STORAGE_KEYS.RESUMES);
+        let resumesChanged = false;
+
+        const ctx = runtime.activePlayContext;
+        if (ctx && (!ctx.timelineHash || ctx.timelineHash === hash)) {
+            ctx.timelineHash = hash;
+            resumes[ctx.movieKey] = normalizeResumeEntry(ctx.movieKey, Object.assign({}, ctx, {
+                timelineHash: hash,
+                time: time,
+                duration: duration,
+                percent: percent,
+                updatedAt: now
+            }));
+            resumesChanged = true;
+        }
+
+        Object.keys(resumes).forEach(function (movieKey) {
+            const entry = normalizeResumeEntry(movieKey, resumes[movieKey]);
+            if (!entry || entry.timelineHash !== hash) {
+                return;
+            }
+            resumes[movieKey] = Object.assign({}, entry, {
+                time: time,
+                duration: duration || entry.duration,
+                percent: percent || entry.percent,
+                updatedAt: now
+            });
+            resumesChanged = true;
+        });
+
+        if (resumesChanged) {
+            Lampa.Storage.set(STORAGE_KEYS.RESUMES, resumes);
+        }
+    }
+
+    function handleTimelineRecordUpdate(data, syncDelayMs) {
+        if (runtime.isApplyingRemote || !data || !data.hash) {
+            return;
+        }
+        const hash = String(data.hash);
+        const time = Math.max(0, Math.floor(Number(data.time) || 0));
+        const duration = Math.max(0, Math.floor(Number(data.duration) || 0));
+        let percent = Math.max(0, Math.min(100, Math.round(Number(data.percent) || 0)));
+        if (percent === 0 && duration > 0 && time > 0) {
+            percent = Math.min(100, Math.round((time / duration) * 100));
+        }
+
+        if (time < CONFIG.MIN_RESUME_SECONDS && percent === 0) {
+            return;
+        }
+
+        const now = Date.now();
+        updateLocalTimelineMeta(hash, now);
+        runtime.lastFileViewSnapshot[hash] = {
+            time: time,
+            duration: duration,
+            percent: percent
+        };
+
+        applyTimelineChangeToResumes(hash, time, duration, percent, now);
+        refreshCurrentResumeBar();
+        scheduleDebouncedSync(typeof syncDelayMs === 'number' ? syncDelayMs : CONFIG.PLAYBACK_SYNC_DEBOUNCE_MS);
+    }
+
+    function reconcileLocalFileViewDiff(triggerSync) {
+        if (runtime.isApplyingRemote) {
+            return false;
+        }
+        const current = getSafeObjectStorage(STORAGE_KEYS.FILE_VIEW);
+        const prev = runtime.lastFileViewSnapshot || {};
+        const now = Date.now();
+        let hasChanges = false;
+
+        Object.keys(current).forEach(function (hash) {
+            const entry = normalizeTimelineEntry(hash, current[hash], 0);
+            if (!entry) {
+                return;
+            }
+            const old = prev[hash];
+            const changed = !old || old.time !== entry.time || old.duration !== entry.duration || old.percent !== entry.percent;
+            if (!changed) {
+                return;
+            }
+            if (entry.time < CONFIG.MIN_RESUME_SECONDS && entry.percent === 0) {
+                return;
+            }
+            hasChanges = true;
+            updateLocalTimelineMeta(hash, now);
+            applyTimelineChangeToResumes(hash, entry.time, entry.duration, entry.percent, now);
+        });
+
+        runtime.lastFileViewSnapshot = cloneFileViewSnapshot(current);
+
+        if (hasChanges) {
+            refreshCurrentResumeBar();
+            if (triggerSync !== false) {
+                scheduleDebouncedSync(CONFIG.IMMEDIATE_SYNC_DELAY_MS);
+            }
+        }
+        return hasChanges;
+    }
+
     function capturePlaybackContext(playData) {
         const descriptor = getActiveMovieDescriptor();
         if (!descriptor) {
@@ -777,13 +1093,15 @@
         const root = getActiveRenderRoot();
         const domCtx = readCurrentDomContext(root);
         const parsedTitle = parseSeasonEpisodeFromText(playData.title || '');
+        const focusedCard = root ? root.querySelector('.online-prestige.focus, .online.focus') : null;
+        const focusedEp = focusedCard && !isInsideSidebarOrFilter(focusedCard) ? extractEpisodeNumberFromCard(focusedCard) : 0;
 
         const season = Number(playData.season || playData.s || parsedTitle.season || domCtx.season || 0);
-        const episode = Number(playData.episode || playData.e || parsedTitle.episode || 0);
+        const episode = Number(playData.episode || playData.e || parsedTitle.episode || focusedEp || 0);
         const voice = String(playData.voice_name || playData.translate || playData.voice || domCtx.voice || '').trim();
         const source = String(domCtx.source || Lampa.Storage.get('online_mod_balanser', '') || Lampa.Storage.get('online_balanser', '') || '').trim();
         const quality = detectQualityLabel(playData);
-        const timelineHash = playData.timeline && playData.timeline.hash ? String(playData.timeline.hash) : '';
+        const timelineHash = String((playData.timeline && playData.timeline.hash) || playData.timeline_hash || playData.hash || '').trim();
         const episodeTitle = String(playData.title || '').trim();
 
         runtime.activePlayContext = {
@@ -799,12 +1117,25 @@
             timelineHash: timelineHash
         };
 
-        const existingTimeline = timelineHash && Lampa.Timeline && typeof Lampa.Timeline.view === 'function'
-            ? Lampa.Timeline.view(timelineHash)
-            : null;
-        const initialTime = existingTimeline ? Number(existingTimeline.time) || 0 : 0;
-        const initialDuration = existingTimeline ? Number(existingTimeline.duration) || 0 : 0;
-        const initialPercent = existingTimeline ? Number(existingTimeline.percent) || 0 : 0;
+        const existingLive = readLiveTimelineByHash(timelineHash);
+        const resumes = getSafeObjectStorage(STORAGE_KEYS.RESUMES);
+        const prevResume = normalizeResumeEntry(descriptor.movieKey, resumes[descriptor.movieKey]);
+        const isSameEpisode = Boolean(
+            prevResume &&
+            prevResume.season === season &&
+            prevResume.episode === episode &&
+            (!timelineHash || !prevResume.timelineHash || prevResume.timelineHash === timelineHash)
+        );
+
+        let initialTime = existingLive ? existingLive.time : 0;
+        let initialDuration = existingLive ? existingLive.duration : 0;
+        let initialPercent = existingLive ? existingLive.percent : 0;
+
+        if (initialTime < CONFIG.MIN_RESUME_SECONDS && isSameEpisode && prevResume.time >= CONFIG.MIN_RESUME_SECONDS) {
+            initialTime = prevResume.time;
+            initialDuration = prevResume.duration;
+            initialPercent = prevResume.percent;
+        }
 
         saveLocalResume(Object.assign({}, runtime.activePlayContext, {
             time: initialTime,
@@ -814,25 +1145,48 @@
         }));
     }
 
-    function handleTimelineRecordUpdate(data) {
-        if (runtime.isApplyingRemote || !data || !data.hash) {
+    function wrapPlayDataTimelineHandler(playData) {
+        if (!playData || !playData.timeline || typeof playData.timeline.handler !== 'function') {
             return;
         }
-        const now = Date.now();
-        updateLocalTimelineMeta(String(data.hash), now);
-
-        const ctx = runtime.activePlayContext;
-        if (ctx && (!ctx.timelineHash || ctx.timelineHash === String(data.hash))) {
-            saveLocalResume(Object.assign({}, ctx, {
-                timelineHash: String(data.hash),
-                time: Math.floor(Number(data.time) || 0),
-                duration: Math.floor(Number(data.duration) || 0),
-                percent: Math.max(0, Math.min(100, Number(data.percent) || 0)),
-                updatedAt: now
-            }));
+        if (playData.timeline.handler.__ghSyncWrapped) {
+            return;
         }
+        const originalHandler = playData.timeline.handler;
+        const hashForHandler = String(playData.timeline.hash || playData.timeline_hash || '').trim();
+        const wrappedHandler = function (percent, time, duration) {
+            const result = originalHandler.apply(this, arguments);
+            if (!runtime.isApplyingRemote && hashForHandler) {
+                handleTimelineRecordUpdate({
+                    hash: hashForHandler,
+                    time: time,
+                    duration: duration,
+                    percent: percent
+                }, CONFIG.PLAYBACK_SYNC_DEBOUNCE_MS);
+            }
+            return result;
+        };
+        wrappedHandler.__ghSyncWrapped = true;
+        playData.timeline.handler = wrappedHandler;
+    }
 
-        scheduleDebouncedSync();
+    function installTimelineUpdateInterceptor() {
+        if (!Lampa.Timeline || typeof Lampa.Timeline.update !== 'function') {
+            return;
+        }
+        if (Lampa.Timeline.update.__ghSyncWrapped) {
+            return;
+        }
+        runtime.originalTimelineUpdate = Lampa.Timeline.update.bind(Lampa.Timeline);
+        const wrappedUpdate = function (data) {
+            const result = runtime.originalTimelineUpdate(data);
+            if (!runtime.isApplyingRemote && data && data.hash) {
+                handleTimelineRecordUpdate(data, CONFIG.PLAYBACK_SYNC_DEBOUNCE_MS);
+            }
+            return result;
+        };
+        wrappedUpdate.__ghSyncWrapped = true;
+        Lampa.Timeline.update = wrappedUpdate;
     }
 
     function installPlayerPlayInterceptor() {
@@ -852,19 +1206,35 @@
                         }
                     }
                     if (pending.time >= CONFIG.MIN_RESUME_SECONDS) {
-                        const targetHash = (playData.timeline && playData.timeline.hash) || pending.timelineHash || '';
+                        const targetHash = String((playData.timeline && playData.timeline.hash) || pending.timelineHash || '').trim();
                         if (targetHash) {
-                            const injectedTimeline = {
-                                hash: targetHash,
-                                time: pending.time,
-                                duration: pending.duration,
-                                percent: pending.percent
-                            };
-                            playData.timeline = Object.assign({}, playData.timeline || {}, injectedTimeline);
+                            if (playData.timeline && typeof playData.timeline === 'object') {
+                                playData.timeline.hash = targetHash;
+                                playData.timeline.time = pending.time;
+                                if (pending.duration > 0) {
+                                    playData.timeline.duration = pending.duration;
+                                }
+                                if (pending.percent > 0) {
+                                    playData.timeline.percent = pending.percent;
+                                }
+                            } else {
+                                playData.timeline = {
+                                    hash: targetHash,
+                                    time: pending.time,
+                                    duration: pending.duration,
+                                    percent: pending.percent
+                                };
+                            }
                             runtime.isApplyingRemote = true;
                             try {
-                                if (Lampa.Timeline && typeof Lampa.Timeline.update === 'function') {
-                                    Lampa.Timeline.update(injectedTimeline);
+                                const updateFn = runtime.originalTimelineUpdate || (Lampa.Timeline && typeof Lampa.Timeline.update === 'function' ? Lampa.Timeline.update.bind(Lampa.Timeline) : null);
+                                if (updateFn) {
+                                    updateFn({
+                                        hash: targetHash,
+                                        time: pending.time,
+                                        duration: pending.duration,
+                                        percent: pending.percent
+                                    });
                                 }
                             } finally {
                                 runtime.isApplyingRemote = false;
@@ -872,6 +1242,7 @@
                         }
                     }
                 }
+                wrapPlayDataTimelineHandler(playData);
                 capturePlaybackContext(playData);
             }
             return originalPlay(playData);
@@ -882,6 +1253,10 @@
         if (runtime.orchestrator.timerId) {
             clearTimeout(runtime.orchestrator.timerId);
             runtime.orchestrator.timerId = null;
+        }
+        if (runtime.orchestrator.stepTimerId) {
+            clearTimeout(runtime.orchestrator.stepTimerId);
+            runtime.orchestrator.stepTimerId = null;
         }
         runtime.orchestrator.active = false;
         runtime.orchestrator.target = null;
@@ -898,6 +1273,19 @@
         if (reason) {
             Lampa.Noty.show('GitHub Sync: ' + reason);
         }
+    }
+
+    function scheduleNextOrchestratorStep() {
+        if (!runtime.orchestrator.active) {
+            return;
+        }
+        if (runtime.orchestrator.stepTimerId) {
+            clearTimeout(runtime.orchestrator.stepTimerId);
+        }
+        runtime.orchestrator.stepTimerId = setTimeout(function () {
+            runtime.orchestrator.stepTimerId = null;
+            advanceOrchestrator();
+        }, CONFIG.ORCHESTRATOR_STEP_DELAY_MS);
     }
 
     function findMatchingSelectItem(items, expectedText, expectedSeason) {
@@ -961,6 +1349,7 @@
                 }
                 setTimeout(function () {
                     onSelect(matchedSource);
+                    scheduleNextOrchestratorStep();
                 }, 0);
                 return;
             }
@@ -971,22 +1360,32 @@
 
             if (hasSubitems) {
                 if (orch.pendingFilterSubmenu === 'SEASON') {
-                    const seasonMenu = findMatchingSelectItem(items, 'сезон', 0);
-                    if (seasonMenu) {
-                        setTimeout(function () {
-                            onSelect(seasonMenu);
-                        }, 0);
+                    orch.pendingFilterSubmenu = null;
+                    const seasonCategory = findMatchingSelectItem(items, 'сезон', 0);
+                    const matchedSeasonSub = seasonCategory ? findMatchingSelectItem(seasonCategory.subitems, 'сезон ' + orch.target.season, orch.target.season) : null;
+                    if (!seasonCategory || !matchedSeasonSub) {
+                        abortOrchestrator('сезон ' + orch.target.season + ' не найден');
                         return;
                     }
+                    setTimeout(function () {
+                        onSelect(seasonCategory, matchedSeasonSub);
+                        scheduleNextOrchestratorStep();
+                    }, 0);
+                    return;
                 }
                 if (orch.pendingFilterSubmenu === 'VOICE') {
-                    const voiceMenu = findMatchingSelectItem(items, 'озвуч', 0) || findMatchingSelectItem(items, 'перевод', 0);
-                    if (voiceMenu) {
-                        setTimeout(function () {
-                            onSelect(voiceMenu);
-                        }, 0);
+                    orch.pendingFilterSubmenu = null;
+                    const voiceCategory = findMatchingSelectItem(items, 'озвуч', 0) || findMatchingSelectItem(items, 'перевод', 0);
+                    const matchedVoiceSub = voiceCategory ? findMatchingSelectItem(voiceCategory.subitems, orch.target.voice, 0) : null;
+                    if (!voiceCategory || !matchedVoiceSub) {
+                        abortOrchestrator('озвучка «' + orch.target.voice + '» не найдена');
                         return;
                     }
+                    setTimeout(function () {
+                        onSelect(voiceCategory, matchedVoiceSub);
+                        scheduleNextOrchestratorStep();
+                    }, 0);
+                    return;
                 }
                 abortOrchestrator('нужный пункт фильтра не найден');
                 return;
@@ -1001,6 +1400,7 @@
                 }
                 setTimeout(function () {
                     onSelect(matchedSeason);
+                    scheduleNextOrchestratorStep();
                 }, 0);
                 return;
             }
@@ -1014,6 +1414,7 @@
                 }
                 setTimeout(function () {
                     onSelect(matchedVoice);
+                    scheduleNextOrchestratorStep();
                 }, 0);
                 return;
             }
@@ -1037,23 +1438,7 @@
         if (!root || !resume) {
             return null;
         }
-        const scrollBody = root.querySelector('.scroll__body');
-        if (!scrollBody) {
-            return null;
-        }
-        const cards = scrollBody.querySelectorAll('.online-prestige, .online, .selector');
-        const candidates = [];
-        for (let i = 0; i < cards.length; i++) {
-            const card = cards[i];
-            if (card.classList.contains(CSS_CLASSES.BAR) || card.closest('.' + CSS_CLASSES.BAR)) {
-                continue;
-            }
-            if (card.closest('.filter')) {
-                continue;
-            }
-            candidates.push(card);
-        }
-
+        const candidates = getEpisodeCards(root);
         if (candidates.length === 0) {
             return null;
         }
@@ -1071,28 +1456,13 @@
         }
 
         const targetEp = Number(resume.episode) || 0;
-        const targetEpPadded = padEpisodeNumber(targetEp);
         const targetTitleNorm = normalizeText(resume.episodeTitle);
 
-        for (let i = 0; i < candidates.length; i++) {
-            const card = candidates[i];
-            const numNode = card.querySelector('.online-prestige__episode-number, .online__episode-number, .online-prestige__num');
-            if (numNode) {
-                const rawNum = Number(String(numNode.textContent || '').replace(/\D+/g, ''));
-                if (rawNum === targetEp && targetEp > 0) {
-                    return card;
+        if (targetEp > 0) {
+            for (let i = 0; i < candidates.length; i++) {
+                if (extractEpisodeNumberFromCard(candidates[i]) === targetEp) {
+                    return candidates[i];
                 }
-            }
-        }
-
-        for (let i = 0; i < candidates.length; i++) {
-            const text = String(candidates[i].textContent || '');
-            const parsed = parseSeasonEpisodeFromText(text);
-            if (targetEp > 0 && parsed.episode === targetEp && (!resume.season || !parsed.season || parsed.season === resume.season)) {
-                return candidates[i];
-            }
-            if (targetEp > 0 && new RegExp('(?:^|\\s)(?:' + targetEpPadded + '|' + targetEp + ')(?:\\s|$)').test(text.slice(0, 12))) {
-                return candidates[i];
             }
         }
 
@@ -1181,27 +1551,28 @@
         if (!resume) {
             return;
         }
+        const hydrated = hydrateResumeWithLiveTimeline(resume);
         stopOrchestrator();
         runtime.orchestrator.active = true;
-        runtime.orchestrator.target = resume;
+        runtime.orchestrator.target = hydrated;
         runtime.orchestrator.timerId = setTimeout(function () {
             abortOrchestrator('не удалось автоматически открыть серию');
         }, CONFIG.ORCHESTRATOR_TIMEOUT_MS);
 
-        const label = resume.mediaType === 'tv' && resume.episode > 0
-            ? 'S' + padEpisodeNumber(resume.season || 1) + 'E' + padEpisodeNumber(resume.episode)
+        const label = hydrated.mediaType === 'tv' && hydrated.episode > 0
+            ? 'S' + padEpisodeNumber(hydrated.season || 1) + 'E' + padEpisodeNumber(hydrated.episode)
             : 'Фильм';
-        Lampa.Noty.show('Продолжить: ' + label + ' (' + formatSeconds(resume.time) + ')');
+        Lampa.Noty.show('Продолжить: ' + label + ' (' + formatSeconds(hydrated.time) + ')');
         advanceOrchestrator();
     }
 
-    function isOnlineEpisodeListContainer(root) {
+    function isOnlineView(root) {
         if (!root) {
             return false;
         }
         const hasFilterBar = Boolean(root.querySelector('.filter, .simple-button--filter, .filter--sort, .filter--filter'));
-        const hasOnlineItems = Boolean(root.querySelector('.online-prestige, .online, .online-prestige-s'));
-        return hasFilterBar && hasOnlineItems;
+        const hasOnlineItems = getEpisodeCards(root).length > 0;
+        return hasFilterBar && (hasOnlineItems || Boolean(findFallbackEpisodeScrollBody(root)));
     }
 
     function createTextElement(tag, className, text) {
@@ -1223,6 +1594,8 @@
             resume.season,
             resume.episode,
             resume.time,
+            resume.duration,
+            resume.percent,
             resume.voice,
             resume.source,
             resume.quality,
@@ -1288,40 +1661,56 @@
         return bar;
     }
 
+    function removeStrayBars(root, keepElement) {
+        const allBars = root.querySelectorAll('.' + CSS_CLASSES.BAR);
+        for (let i = 0; i < allBars.length; i++) {
+            if (allBars[i] !== keepElement) {
+                allBars[i].remove();
+            }
+        }
+    }
+
     function refreshCurrentResumeBar() {
         const descriptor = getActiveMovieDescriptor();
         const root = getActiveRenderRoot();
-        if (!descriptor || !root || !isOnlineEpisodeListContainer(root)) {
+        if (!descriptor || !root || !isOnlineView(root)) {
             return;
         }
 
-        const scrollBody = root.querySelector('.scroll__body');
-        if (!scrollBody) {
+        const episodeCards = getEpisodeCards(root);
+        const firstCard = episodeCards.length > 0 ? episodeCards[0] : null;
+        const targetContainer = firstCard ? firstCard.parentNode : findFallbackEpisodeScrollBody(root);
+        if (!targetContainer) {
             return;
         }
 
         const resumes = getSafeObjectStorage(STORAGE_KEYS.RESUMES);
-        const saved = normalizeResumeEntry(descriptor.movieKey, resumes[descriptor.movieKey]);
-        const existingBar = scrollBody.querySelector('.' + CSS_CLASSES.BAR);
+        const rawSaved = normalizeResumeEntry(descriptor.movieKey, resumes[descriptor.movieKey]);
+        const saved = rawSaved ? hydrateResumeWithLiveTimeline(rawSaved) : null;
 
         if (!saved || (saved.time < CONFIG.MIN_RESUME_SECONDS && saved.episode === 0)) {
-            if (existingBar) {
-                existingBar.remove();
-            }
+            removeStrayBars(root, null);
             return;
         }
 
         const nextBar = buildResumeBarElement(saved);
-        if (existingBar && existingBar.getAttribute('data-gh-sig') === nextBar.getAttribute('data-gh-sig')) {
+        const nextSig = nextBar.getAttribute('data-gh-sig');
+        const existingInTarget = targetContainer.querySelector('.' + CSS_CLASSES.BAR);
+
+        if (existingInTarget && existingInTarget.getAttribute('data-gh-sig') === nextSig) {
+            removeStrayBars(root, existingInTarget);
+            if (firstCard && existingInTarget.nextSibling !== firstCard) {
+                targetContainer.insertBefore(existingInTarget, firstCard);
+            }
             return;
         }
 
-        if (existingBar) {
-            existingBar.replaceWith(nextBar);
+        removeStrayBars(root, null);
+        if (firstCard) {
+            targetContainer.insertBefore(nextBar, firstCard);
             return;
         }
-
-        scrollBody.insertBefore(nextBar, scrollBody.firstChild);
+        targetContainer.insertBefore(nextBar, targetContainer.firstChild);
     }
 
     function detachActiveObserver() {
@@ -1385,14 +1774,14 @@
         style.textContent = [
             '.gh-resume-bar {',
             '  position: relative;',
-            '  margin: 0.35em 0 0.85em 0;',
+            '  margin: 0.25em 0 0.85em 0;',
             '  padding: 0.75em 1em 0.9em 1em;',
             '  border-radius: 0.7em;',
             '  background: rgba(255, 255, 255, 0.09);',
             '  border: 2px solid rgba(255, 255, 255, 0.14);',
             '  cursor: pointer;',
             '  overflow: hidden;',
-            '  transition: background-color 0.18s ease, border-color 0.18s ease, transform 0.18s ease;',
+            '  transition: background-color 0.18s ease, border-color 0.18s ease;',
             '  box-sizing: border-box;',
             '  width: 100%;',
             '}',
@@ -1565,13 +1954,19 @@
         Lampa.SettingsApi.addParam({
             component: CONFIG.COMPONENT_ID,
             param: { name: STORAGE_KEYS.AUTO_SYNC, type: 'trigger', default: true },
-            field: { name: 'Автосинхронизация', description: 'Синхронизировать при запуске и остановке видео' }
+            field: { name: 'Автосинхронизация', description: 'Синхронизировать при запуске, возврате и остановке видео' }
         });
 
         Lampa.SettingsApi.addParam({
             component: CONFIG.COMPONENT_ID,
             param: { name: 'gh_sync_btn_now', type: 'button' },
             field: { name: 'Синхронизировать сейчас', description: 'Объединить локальные и облачные таймкоды' },
+            onRender: function (item) {
+                const last = String(Lampa.Storage.get(STORAGE_KEYS.LAST_STATUS, '')).trim();
+                if (last) {
+                    item.find('.settings-param__descr').text('Последняя: ' + last);
+                }
+            },
             onChange: function () {
                 executeSync({ notify: true });
             }
@@ -1587,19 +1982,29 @@
         });
     }
 
+    function handleReturnToForeground() {
+        const hadLocalDiff = reconcileLocalFileViewDiff(true);
+        if (!hadLocalDiff) {
+            triggerThrottledPullSync();
+        }
+        setTimeout(refreshCurrentResumeBar, 300);
+    }
+
     function bindLifecycleListeners() {
         if (Lampa.Timeline && Lampa.Timeline.listener) {
             Lampa.Timeline.listener.follow('update', function (event) {
-                if (event && event.data) {
-                    handleTimelineRecordUpdate(event.data);
+                const payload = event && event.data ? event.data : event;
+                if (payload && payload.hash) {
+                    handleTimelineRecordUpdate(payload, CONFIG.PLAYBACK_SYNC_DEBOUNCE_MS);
                 }
             });
         }
 
         if (Lampa.Player && Lampa.Player.listener) {
             Lampa.Player.listener.follow('destroy', function () {
+                const hadDiff = reconcileLocalFileViewDiff(false);
                 if (isAutoSyncEnabled() && getSyncCredentials().isValid) {
-                    executeSync({ notify: false });
+                    scheduleDebouncedSync(hadDiff ? CONFIG.IMMEDIATE_SYNC_DELAY_MS : CONFIG.IMMEDIATE_SYNC_DELAY_MS);
                 }
                 setTimeout(refreshCurrentResumeBar, 350);
             });
@@ -1610,7 +2015,7 @@
                 if (runtime.isApplyingRemote || !event || event.name !== STORAGE_KEYS.FILE_VIEW) {
                     return;
                 }
-                scheduleDebouncedSync();
+                reconcileLocalFileViewDiff(true);
             });
         }
 
@@ -1620,14 +2025,28 @@
                     return;
                 }
                 stopOrchestrator();
+                reconcileLocalFileViewDiff(true);
+                triggerThrottledPullSync();
                 setTimeout(attachObserverToActiveView, 150);
             });
         }
+
+        document.addEventListener('visibilitychange', function () {
+            if (document.visibilityState === 'visible') {
+                handleReturnToForeground();
+            }
+        });
+
+        window.addEventListener('focus', function () {
+            handleReturnToForeground();
+        });
     }
 
     function initializePlugin() {
+        runtime.lastFileViewSnapshot = cloneFileViewSnapshot(getSafeObjectStorage(STORAGE_KEYS.FILE_VIEW));
         injectStyles();
         registerSettingsUi();
+        installTimelineUpdateInterceptor();
         installPlayerPlayInterceptor();
         installSelectInterceptor();
         bindLifecycleListeners();
