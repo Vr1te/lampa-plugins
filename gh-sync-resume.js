@@ -12,15 +12,19 @@
         GITHUB_API_BASE: 'https://api.github.com',
         DEFAULT_BRANCH: 'main',
         DEFAULT_FILE_PATH: 'lampa-sync.json',
-        STATE_VERSION: 1,
+        STATE_VERSION: 2,
         MAX_CONFLICT_RETRIES: 2,
-        PLAYBACK_SYNC_DEBOUNCE_MS: 8000,
-        IMMEDIATE_SYNC_DELAY_MS: 600,
-        PULL_THROTTLE_MS: 12000,
+        PLAYBACK_SYNC_DEBOUNCE_MS: 5000,
+        IMMEDIATE_SYNC_DELAY_MS: 450,
+        EXTERNAL_PLAYER_RECONCILE_DELAY_MS: 1400,
+        PULL_THROTTLE_MS: 5000,
         MUTATION_DEBOUNCE_MS: 220,
         ORCHESTRATOR_TIMEOUT_MS: 18000,
         ORCHESTRATOR_STEP_DELAY_MS: 450,
         PLAYBACK_ARM_TIMEOUT_MS: 20000,
+        PLAYBACK_SETTLE_MS: 4000,
+        VIDEO_PERSIST_INTERVAL_MS: 5000,
+        SEEK_JUMP_THRESHOLD_SEC: 4,
         MIN_RESUME_SECONDS: 3,
         BASE64_CHUNK_SIZE: 32768
     };
@@ -33,8 +37,10 @@
         AUTO_SYNC: 'gh_sync_auto',
         META: 'gh_sync_local_meta',
         RESUMES: 'gh_sync_local_resumes',
+        EPISODES: 'gh_sync_local_episodes',
         LAST_STATUS: 'gh_sync_last_status',
-        FILE_VIEW: 'file_view'
+        FILE_VIEW: 'file_view',
+        ACCOUNT: 'account'
     };
 
     const HTTP_STATUS = {
@@ -73,6 +79,15 @@
         mutationDebounceTimer: null,
         activePlayContext: null,
         pendingPlaybackTarget: null,
+        playerSession: {
+            active: false,
+            startedAt: 0,
+            lastTime: -1,
+            lastDuration: 0,
+            lastPersistedTime: -1,
+            lastPersistAt: 0,
+            hasValidPosition: false
+        },
         orchestrator: {
             active: false,
             target: null,
@@ -168,6 +183,84 @@
         return {};
     }
 
+    function isFileViewStorageKey(key) {
+        return /^file_view(?:_.+)?$/.test(String(key || ''));
+    }
+
+    function getActiveProfileId() {
+        const account = getSafeObjectStorage(STORAGE_KEYS.ACCOUNT);
+        if (account.profile && account.profile.id) {
+            return String(account.profile.id).trim();
+        }
+        return '';
+    }
+
+    function getActiveFileViewKeys() {
+        const keySet = {};
+        const ordered = [];
+        const profileId = getActiveProfileId();
+
+        function addKey(key) {
+            if (!key || keySet[key]) {
+                return;
+            }
+            keySet[key] = true;
+            ordered.push(key);
+        }
+
+        if (profileId) {
+            addKey(STORAGE_KEYS.FILE_VIEW + '_' + profileId);
+        }
+        addKey(STORAGE_KEYS.FILE_VIEW);
+
+        try {
+            if (typeof window.localStorage !== 'undefined') {
+                for (let i = 0; i < window.localStorage.length; i++) {
+                    const candidate = window.localStorage.key(i);
+                    if (isFileViewStorageKey(candidate)) {
+                        addKey(candidate);
+                    }
+                }
+            }
+        } catch (err) {
+            console.error('[GH Sync] localStorage scan failed', err);
+        }
+
+        return ordered;
+    }
+
+    function readAggregatedLocalFileView() {
+        const keys = getActiveFileViewKeys();
+        const combined = {};
+        for (let i = keys.length - 1; i >= 0; i--) {
+            const bucket = getSafeObjectStorage(keys[i]);
+            Object.keys(bucket).forEach(function (hash) {
+                if (bucket[hash] && typeof bucket[hash] === 'object') {
+                    combined[hash] = bucket[hash];
+                }
+            });
+        }
+        return combined;
+    }
+
+    function writeEntryToAllFileViewStores(entry) {
+        if (!entry || !entry.hash) {
+            return;
+        }
+        const keys = getActiveFileViewKeys();
+        const record = {
+            hash: entry.hash,
+            time: entry.time,
+            duration: entry.duration,
+            percent: entry.percent
+        };
+        keys.forEach(function (storageKey) {
+            const bucket = getSafeObjectStorage(storageKey);
+            bucket[entry.hash] = record;
+            Lampa.Storage.set(storageKey, bucket);
+        });
+    }
+
     function setLastSyncStatus(text) {
         Lampa.Storage.set(STORAGE_KEYS.LAST_STATUS, formatClockTime(Date.now()) + ' — ' + String(text || ''));
     }
@@ -198,13 +291,28 @@
         return CONFIG.GITHUB_API_BASE + '/repos/' + encodeURIComponent(creds.owner) + '/' + encodeURIComponent(creds.repo) + '/contents/' + encodedPath;
     }
 
+    function buildEpisodeKey(movieKey, season, episode) {
+        if (!movieKey) {
+            return '';
+        }
+        return String(movieKey) + ':s' + (Math.max(0, Number(season) || 0)) + ':e' + (Math.max(0, Number(episode) || 0));
+    }
+
     function createEmptyState() {
         return {
             version: CONFIG.STATE_VERSION,
             updatedAt: 0,
             timelines: {},
-            resumes: {}
+            resumes: {},
+            episodes: {}
         };
+    }
+
+    function computePercent(time, duration, fallbackPercent) {
+        if (duration > 0 && time >= 0) {
+            return Math.max(0, Math.min(100, Math.round((time / duration) * 100)));
+        }
+        return Math.max(0, Math.min(100, Math.round(Number(fallbackPercent) || 0)));
     }
 
     function normalizeTimelineEntry(hash, entry, fallbackTimestamp) {
@@ -213,10 +321,7 @@
         }
         const time = Math.max(0, Math.floor(Number(entry.time) || 0));
         const duration = Math.max(0, Math.floor(Number(entry.duration) || 0));
-        let percent = Math.max(0, Math.min(100, Math.round(Number(entry.percent) || 0)));
-        if (percent === 0 && duration > 0 && time > 0) {
-            percent = Math.min(100, Math.round((time / duration) * 100));
-        }
+        const percent = computePercent(time, duration, entry.percent);
         const updatedAt = Number(entry.updatedAt) || Number(fallbackTimestamp) || 0;
         return {
             hash: String(hash),
@@ -233,10 +338,7 @@
         }
         const time = Math.max(0, Math.floor(Number(entry.time) || 0));
         const duration = Math.max(0, Math.floor(Number(entry.duration) || 0));
-        let percent = Math.max(0, Math.min(100, Math.round(Number(entry.percent) || 0)));
-        if (percent === 0 && duration > 0 && time > 0) {
-            percent = Math.min(100, Math.round((time / duration) * 100));
-        }
+        const percent = computePercent(time, duration, entry.percent);
         return {
             movieKey: String(movieKey),
             mediaType: entry.mediaType === 'movie' ? 'movie' : 'tv',
@@ -247,6 +349,29 @@
             voice: String(entry.voice || '').trim(),
             quality: String(entry.quality || '').trim(),
             component: String(entry.component || '').trim(),
+            timelineHash: String(entry.timelineHash || '').trim(),
+            time: time,
+            duration: duration,
+            percent: percent,
+            updatedAt: Number(entry.updatedAt) || 0
+        };
+    }
+
+    function normalizeEpisodeEntry(episodeKey, entry) {
+        if (!episodeKey || !entry || typeof entry !== 'object') {
+            return null;
+        }
+        const time = Math.max(0, Math.floor(Number(entry.time) || 0));
+        const duration = Math.max(0, Math.floor(Number(entry.duration) || 0));
+        const percent = computePercent(time, duration, entry.percent);
+        return {
+            key: String(episodeKey),
+            movieKey: String(entry.movieKey || '').trim(),
+            season: Math.max(0, Number(entry.season) || 0),
+            episode: Math.max(0, Number(entry.episode) || 0),
+            source: String(entry.source || '').trim(),
+            voice: String(entry.voice || '').trim(),
+            quality: String(entry.quality || '').trim(),
             timelineHash: String(entry.timelineHash || '').trim(),
             time: time,
             duration: duration,
@@ -274,51 +399,48 @@
         return snapshot;
     }
 
-    function readLiveTimelineByHash(hash) {
-        if (!hash) {
+    function resolveLatestResumeView(resume) {
+        if (!resume) {
             return null;
         }
-        const fileView = getSafeObjectStorage(STORAGE_KEYS.FILE_VIEW);
-        const fromStorage = normalizeTimelineEntry(hash, fileView[hash], 0);
-        let fromApi = null;
-        if (Lampa.Timeline && typeof Lampa.Timeline.view === 'function') {
-            try {
-                fromApi = normalizeTimelineEntry(hash, Lampa.Timeline.view(hash), 0);
-            } catch (err) {
-                console.error('[GH Sync] Timeline.view failed', err);
+        let best = Object.assign({}, resume);
+        const meta = getSafeObjectStorage(STORAGE_KEYS.META);
+
+        const epKey = buildEpisodeKey(best.movieKey, best.season, best.episode);
+        if (epKey) {
+            const episodes = getSafeObjectStorage(STORAGE_KEYS.EPISODES);
+            const epEntry = normalizeEpisodeEntry(epKey, episodes[epKey]);
+            if (epEntry && (epEntry.updatedAt > best.updatedAt || (best.time < CONFIG.MIN_RESUME_SECONDS && epEntry.time >= CONFIG.MIN_RESUME_SECONDS))) {
+                best = Object.assign({}, best, {
+                    time: epEntry.time,
+                    duration: epEntry.duration || best.duration,
+                    percent: epEntry.percent,
+                    updatedAt: epEntry.updatedAt
+                });
             }
         }
-        if (fromStorage && fromApi) {
-            return fromStorage.time >= fromApi.time ? fromStorage : fromApi;
-        }
-        return fromStorage || fromApi;
-    }
 
-    function hydrateResumeWithLiveTimeline(resume) {
-        if (!resume || !resume.timelineHash) {
-            return resume;
+        if (best.timelineHash) {
+            const aggregated = readAggregatedLocalFileView();
+            const live = normalizeTimelineEntry(best.timelineHash, aggregated[best.timelineHash], meta[best.timelineHash]);
+            if (live && (live.updatedAt > best.updatedAt || (best.time < CONFIG.MIN_RESUME_SECONDS && live.time >= CONFIG.MIN_RESUME_SECONDS))) {
+                best = Object.assign({}, best, {
+                    time: live.time,
+                    duration: live.duration || best.duration,
+                    percent: live.percent,
+                    updatedAt: Math.max(best.updatedAt, live.updatedAt)
+                });
+            }
         }
-        const live = readLiveTimelineByHash(resume.timelineHash);
-        if (!live || (live.time < CONFIG.MIN_RESUME_SECONDS && live.percent === 0)) {
-            return resume;
-        }
-        const meta = getSafeObjectStorage(STORAGE_KEYS.META);
-        const liveUpdatedAt = Number(meta[resume.timelineHash]) || 0;
-        if (resume.time < CONFIG.MIN_RESUME_SECONDS || liveUpdatedAt >= resume.updatedAt || live.time > resume.time) {
-            return Object.assign({}, resume, {
-                time: live.time,
-                duration: live.duration || resume.duration,
-                percent: live.percent || resume.percent,
-                updatedAt: Math.max(resume.updatedAt, liveUpdatedAt)
-            });
-        }
-        return resume;
+
+        return best;
     }
 
     function buildLocalStateSnapshot() {
-        const fileView = getSafeObjectStorage(STORAGE_KEYS.FILE_VIEW);
+        const fileView = readAggregatedLocalFileView();
         const localMeta = getSafeObjectStorage(STORAGE_KEYS.META);
         const localResumes = getSafeObjectStorage(STORAGE_KEYS.RESUMES);
+        const localEpisodes = getSafeObjectStorage(STORAGE_KEYS.EPISODES);
         const state = createEmptyState();
         let maxTimestamp = 0;
 
@@ -333,15 +455,26 @@
             }
         });
 
+        Object.keys(localEpisodes).forEach(function (epKey) {
+            const normalized = normalizeEpisodeEntry(epKey, localEpisodes[epKey]);
+            if (!normalized) {
+                return;
+            }
+            state.episodes[epKey] = normalized;
+            if (normalized.updatedAt > maxTimestamp) {
+                maxTimestamp = normalized.updatedAt;
+            }
+        });
+
         Object.keys(localResumes).forEach(function (movieKey) {
             const normalized = normalizeResumeEntry(movieKey, localResumes[movieKey]);
             if (!normalized) {
                 return;
             }
-            const hydrated = hydrateResumeWithLiveTimeline(normalized);
-            state.resumes[movieKey] = hydrated;
-            if (hydrated.updatedAt > maxTimestamp) {
-                maxTimestamp = hydrated.updatedAt;
+            const resolved = resolveLatestResumeView(normalized);
+            state.resumes[movieKey] = resolved;
+            if (resolved.updatedAt > maxTimestamp) {
+                maxTimestamp = resolved.updatedAt;
             }
         });
 
@@ -349,7 +482,7 @@
         return state;
     }
 
-    function pickNewerTimeline(localEntry, remoteEntry) {
+    function pickNewerByTimestamp(localEntry, remoteEntry) {
         if (!localEntry) {
             return remoteEntry;
         }
@@ -365,26 +498,7 @@
         if (remoteEntry.time !== localEntry.time) {
             return remoteEntry.time > localEntry.time ? remoteEntry : localEntry;
         }
-        if (remoteEntry.percent > localEntry.percent) {
-            return remoteEntry;
-        }
         return localEntry;
-    }
-
-    function pickNewerResume(localEntry, remoteEntry) {
-        if (!localEntry) {
-            return remoteEntry;
-        }
-        if (!remoteEntry) {
-            return localEntry;
-        }
-        if (remoteEntry.updatedAt > localEntry.updatedAt) {
-            return remoteEntry;
-        }
-        if (localEntry.updatedAt > remoteEntry.updatedAt) {
-            return localEntry;
-        }
-        return localEntry.time >= remoteEntry.time ? localEntry : remoteEntry;
     }
 
     function mergeSyncStates(localState, remoteState) {
@@ -398,7 +512,7 @@
         allTimelineHashes.forEach(function (hash) {
             const localEntry = normalizeTimelineEntry(hash, localState.timelines[hash], 0);
             const remoteEntry = normalizeTimelineEntry(hash, remoteState.timelines[hash], 0);
-            const winner = pickNewerTimeline(localEntry, remoteEntry);
+            const winner = pickNewerByTimestamp(localEntry, remoteEntry);
             if (!winner) {
                 return;
             }
@@ -419,10 +533,31 @@
                 !localEntry ||
                 localEntry.time !== winner.time ||
                 localEntry.duration !== winner.duration ||
-                localEntry.percent !== winner.percent
+                localEntry.percent !== winner.percent ||
+                localEntry.updatedAt !== winner.updatedAt
             ) {
                 localNeedsUpdate = true;
                 changedTimelineHashes.push(hash);
+            }
+        });
+
+        const allEpisodeKeys = Object.keys(Object.assign({}, localState.episodes, remoteState.episodes));
+        allEpisodeKeys.forEach(function (epKey) {
+            const localEntry = normalizeEpisodeEntry(epKey, localState.episodes[epKey]);
+            const remoteEntry = normalizeEpisodeEntry(epKey, remoteState.episodes[epKey]);
+            const winner = pickNewerByTimestamp(localEntry, remoteEntry);
+            if (!winner) {
+                return;
+            }
+            merged.episodes[epKey] = winner;
+            if (winner.updatedAt > maxTimestamp) {
+                maxTimestamp = winner.updatedAt;
+            }
+            if (!remoteEntry || JSON.stringify(remoteEntry) !== JSON.stringify(winner)) {
+                remoteNeedsUpdate = true;
+            }
+            if (!localEntry || JSON.stringify(localEntry) !== JSON.stringify(winner)) {
+                localNeedsUpdate = true;
             }
         });
 
@@ -430,19 +565,30 @@
         allResumeKeys.forEach(function (movieKey) {
             const localEntry = normalizeResumeEntry(movieKey, localState.resumes[movieKey]);
             const remoteEntry = normalizeResumeEntry(movieKey, remoteState.resumes[movieKey]);
-            const winner = pickNewerResume(localEntry, remoteEntry);
+            let winner = pickNewerByTimestamp(localEntry, remoteEntry);
             if (!winner) {
                 return;
             }
-            if (winner.timelineHash && merged.timelines[winner.timelineHash]) {
-                const matchedTimeline = merged.timelines[winner.timelineHash];
-                if (matchedTimeline.updatedAt >= winner.updatedAt || (winner.time < CONFIG.MIN_RESUME_SECONDS && matchedTimeline.time > 0)) {
-                    winner.time = matchedTimeline.time;
-                    winner.duration = matchedTimeline.duration || winner.duration;
-                    winner.percent = matchedTimeline.percent || winner.percent;
-                    winner.updatedAt = Math.max(winner.updatedAt, matchedTimeline.updatedAt);
-                }
+            const epKey = buildEpisodeKey(winner.movieKey, winner.season, winner.episode);
+            if (epKey && merged.episodes[epKey] && merged.episodes[epKey].updatedAt > winner.updatedAt) {
+                const newerEp = merged.episodes[epKey];
+                winner = Object.assign({}, winner, {
+                    time: newerEp.time,
+                    duration: newerEp.duration || winner.duration,
+                    percent: newerEp.percent,
+                    updatedAt: newerEp.updatedAt
+                });
             }
+            if (winner.timelineHash && merged.timelines[winner.timelineHash] && merged.timelines[winner.timelineHash].updatedAt > winner.updatedAt) {
+                const newerTl = merged.timelines[winner.timelineHash];
+                winner = Object.assign({}, winner, {
+                    time: newerTl.time,
+                    duration: newerTl.duration || winner.duration,
+                    percent: newerTl.percent,
+                    updatedAt: newerTl.updatedAt
+                });
+            }
+
             merged.resumes[movieKey] = winner;
             if (winner.updatedAt > maxTimestamp) {
                 maxTimestamp = winner.updatedAt;
@@ -467,23 +613,33 @@
     function applyMergedStateLocally(mergedState, changedTimelineHashes) {
         runtime.isApplyingRemote = true;
         try {
-            const fileView = getSafeObjectStorage(STORAGE_KEYS.FILE_VIEW);
             const localMeta = getSafeObjectStorage(STORAGE_KEYS.META);
+            const keys = getActiveFileViewKeys();
+            const buckets = {};
+            keys.forEach(function (storageKey) {
+                buckets[storageKey] = getSafeObjectStorage(storageKey);
+            });
 
             Object.keys(mergedState.timelines).forEach(function (hash) {
                 const entry = mergedState.timelines[hash];
-                fileView[hash] = {
+                const record = {
                     hash: entry.hash,
                     time: entry.time,
                     duration: entry.duration,
                     percent: entry.percent
                 };
+                keys.forEach(function (storageKey) {
+                    buckets[storageKey][hash] = record;
+                });
                 localMeta[hash] = entry.updatedAt;
             });
 
-            Lampa.Storage.set(STORAGE_KEYS.FILE_VIEW, fileView);
+            keys.forEach(function (storageKey) {
+                Lampa.Storage.set(storageKey, buckets[storageKey]);
+            });
             Lampa.Storage.set(STORAGE_KEYS.META, localMeta);
             Lampa.Storage.set(STORAGE_KEYS.RESUMES, mergedState.resumes);
+            Lampa.Storage.set(STORAGE_KEYS.EPISODES, mergedState.episodes);
 
             const updateFn = runtime.originalTimelineUpdate || (Lampa.Timeline && typeof Lampa.Timeline.update === 'function' ? Lampa.Timeline.update.bind(Lampa.Timeline) : null);
             if (updateFn && Array.isArray(changedTimelineHashes)) {
@@ -505,7 +661,7 @@
                 });
             }
 
-            runtime.lastFileViewSnapshot = cloneFileViewSnapshot(getSafeObjectStorage(STORAGE_KEYS.FILE_VIEW));
+            runtime.lastFileViewSnapshot = cloneFileViewSnapshot(readAggregatedLocalFileView());
         } finally {
             runtime.isApplyingRemote = false;
         }
@@ -545,7 +701,8 @@
                         version: Number(rawJson.version) || CONFIG.STATE_VERSION,
                         updatedAt: Number(rawJson.updatedAt) || 0,
                         timelines: rawJson.timelines && typeof rawJson.timelines === 'object' ? rawJson.timelines : {},
-                        resumes: rawJson.resumes && typeof rawJson.resumes === 'object' ? rawJson.resumes : {}
+                        resumes: rawJson.resumes && typeof rawJson.resumes === 'object' ? rawJson.resumes : {},
+                        episodes: rawJson.episodes && typeof rawJson.episodes === 'object' ? rawJson.episodes : {}
                     };
                 }
             } catch (parseError) {
@@ -593,6 +750,26 @@
         }
     }
 
+    function describeLatestResumeForStatus(resumes) {
+        let latest = null;
+        Object.keys(resumes || {}).forEach(function (key) {
+            const item = resumes[key];
+            if (!item || typeof item !== 'object') {
+                return;
+            }
+            if (!latest || (Number(item.updatedAt) || 0) > (Number(latest.updatedAt) || 0)) {
+                latest = item;
+            }
+        });
+        if (!latest) {
+            return '';
+        }
+        const tag = latest.mediaType === 'tv' && latest.episode > 0
+            ? 'S' + padEpisodeNumber(latest.season || 1) + 'E' + padEpisodeNumber(latest.episode)
+            : 'Фильм';
+        return tag + ' ' + formatSeconds(latest.time);
+    }
+
     async function executeSync(options) {
         const notify = Boolean(options && options.notify);
         const creds = getSyncCredentials();
@@ -630,11 +807,14 @@
 
                     runtime.lastPullTimestamp = Date.now();
                     const timelineCount = Object.keys(result.mergedState.timelines).length;
-                    const resumeCount = Object.keys(result.mergedState.resumes).length;
-                    setLastSyncStatus('OK (таймкоды: ' + timelineCount + ', позиции: ' + resumeCount + ')');
+                    const latestLabel = describeLatestResumeForStatus(result.mergedState.resumes);
+                    const summary = latestLabel
+                        ? 'OK (' + latestLabel + ', всего: ' + timelineCount + ')'
+                        : 'OK (таймкоды: ' + timelineCount + ')';
+                    setLastSyncStatus(summary);
 
                     if (notify) {
-                        Lampa.Noty.show('GitHub Sync: синхронизировано (таймкоды: ' + timelineCount + ', позиции: ' + resumeCount + ')');
+                        Lampa.Noty.show('GitHub Sync: ' + summary);
                     }
                     return true;
                 } catch (err) {
@@ -961,16 +1141,6 @@
         return null;
     }
 
-    function saveLocalResume(entry) {
-        const normalized = normalizeResumeEntry(entry.movieKey, entry);
-        if (!normalized) {
-            return;
-        }
-        const resumes = getSafeObjectStorage(STORAGE_KEYS.RESUMES);
-        resumes[normalized.movieKey] = normalized;
-        Lampa.Storage.set(STORAGE_KEYS.RESUMES, resumes);
-    }
-
     function updateLocalTimelineMeta(hash, timestamp) {
         if (!hash) {
             return;
@@ -980,67 +1150,188 @@
         Lampa.Storage.set(STORAGE_KEYS.META, meta);
     }
 
-    function applyTimelineChangeToResumes(hash, time, duration, percent, now) {
+    function saveEpisodePosition(ctx, time, duration, percent, now) {
+        if (!ctx || !ctx.movieKey) {
+            return;
+        }
+        const epKey = buildEpisodeKey(ctx.movieKey, ctx.season, ctx.episode);
+        if (!epKey) {
+            return;
+        }
+        const episodes = getSafeObjectStorage(STORAGE_KEYS.EPISODES);
+        episodes[epKey] = normalizeEpisodeEntry(epKey, {
+            movieKey: ctx.movieKey,
+            season: ctx.season,
+            episode: ctx.episode,
+            source: ctx.source,
+            voice: ctx.voice,
+            quality: ctx.quality,
+            timelineHash: ctx.timelineHash,
+            time: time,
+            duration: duration,
+            percent: percent,
+            updatedAt: now
+        });
+        Lampa.Storage.set(STORAGE_KEYS.EPISODES, episodes);
+    }
+
+    function applyTimelineChangeToRecords(hash, time, duration, percent, now) {
         const resumes = getSafeObjectStorage(STORAGE_KEYS.RESUMES);
         let resumesChanged = false;
 
         const ctx = runtime.activePlayContext;
-        if (ctx && (!ctx.timelineHash || ctx.timelineHash === hash)) {
-            ctx.timelineHash = hash;
+        if (ctx && (!ctx.timelineHash || !hash || ctx.timelineHash === hash)) {
+            if (hash) {
+                ctx.timelineHash = hash;
+            }
             resumes[ctx.movieKey] = normalizeResumeEntry(ctx.movieKey, Object.assign({}, ctx, {
-                timelineHash: hash,
+                timelineHash: ctx.timelineHash,
                 time: time,
                 duration: duration,
                 percent: percent,
                 updatedAt: now
             }));
             resumesChanged = true;
+            saveEpisodePosition(ctx, time, duration, percent, now);
         }
 
-        Object.keys(resumes).forEach(function (movieKey) {
-            const entry = normalizeResumeEntry(movieKey, resumes[movieKey]);
-            if (!entry || entry.timelineHash !== hash) {
-                return;
-            }
-            resumes[movieKey] = Object.assign({}, entry, {
-                time: time,
-                duration: duration || entry.duration,
-                percent: percent || entry.percent,
-                updatedAt: now
+        if (hash) {
+            const episodes = getSafeObjectStorage(STORAGE_KEYS.EPISODES);
+            let episodesChanged = false;
+
+            Object.keys(resumes).forEach(function (movieKey) {
+                const entry = normalizeResumeEntry(movieKey, resumes[movieKey]);
+                if (!entry || entry.timelineHash !== hash) {
+                    return;
+                }
+                resumes[movieKey] = Object.assign({}, entry, {
+                    time: time,
+                    duration: duration || entry.duration,
+                    percent: percent,
+                    updatedAt: now
+                });
+                resumesChanged = true;
             });
-            resumesChanged = true;
-        });
+
+            Object.keys(episodes).forEach(function (epKey) {
+                const entry = normalizeEpisodeEntry(epKey, episodes[epKey]);
+                if (!entry || entry.timelineHash !== hash) {
+                    return;
+                }
+                episodes[epKey] = Object.assign({}, entry, {
+                    time: time,
+                    duration: duration || entry.duration,
+                    percent: percent,
+                    updatedAt: now
+                });
+                episodesChanged = true;
+            });
+
+            if (episodesChanged) {
+                Lampa.Storage.set(STORAGE_KEYS.EPISODES, episodes);
+            }
+        }
 
         if (resumesChanged) {
             Lampa.Storage.set(STORAGE_KEYS.RESUMES, resumes);
         }
     }
 
-    function handleTimelineRecordUpdate(data, syncDelayMs) {
-        if (runtime.isApplyingRemote || !data || !data.hash) {
+    function persistPositionDirectly(hash, time, duration, syncDelayMs, pushToLampaTimeline) {
+        if (runtime.isApplyingRemote) {
             return;
         }
-        const hash = String(data.hash);
-        const time = Math.max(0, Math.floor(Number(data.time) || 0));
-        const duration = Math.max(0, Math.floor(Number(data.duration) || 0));
-        let percent = Math.max(0, Math.min(100, Math.round(Number(data.percent) || 0)));
-        if (percent === 0 && duration > 0 && time > 0) {
-            percent = Math.min(100, Math.round((time / duration) * 100));
-        }
+        const safeTime = Math.max(0, Math.floor(Number(time) || 0));
+        const safeDuration = Math.max(0, Math.floor(Number(duration) || 0));
+        const safePercent = computePercent(safeTime, safeDuration, 0);
 
-        if (time < CONFIG.MIN_RESUME_SECONDS && percent === 0) {
+        if (safeTime < CONFIG.MIN_RESUME_SECONDS && safePercent === 0) {
             return;
         }
 
         const now = Date.now();
-        updateLocalTimelineMeta(hash, now);
-        runtime.lastFileViewSnapshot[hash] = {
-            time: time,
-            duration: duration,
-            percent: percent
+        if (hash) {
+            const entry = {
+                hash: String(hash),
+                time: safeTime,
+                duration: safeDuration,
+                percent: safePercent
+            };
+            updateLocalTimelineMeta(entry.hash, now);
+            runtime.lastFileViewSnapshot[entry.hash] = {
+                time: entry.time,
+                duration: entry.duration,
+                percent: entry.percent
+            };
+
+            if (pushToLampaTimeline) {
+                runtime.isApplyingRemote = true;
+                try {
+                    writeEntryToAllFileViewStores(entry);
+                    const updateFn = runtime.originalTimelineUpdate || (Lampa.Timeline && typeof Lampa.Timeline.update === 'function' ? Lampa.Timeline.update.bind(Lampa.Timeline) : null);
+                    if (updateFn) {
+                        updateFn(entry);
+                    }
+                } catch (err) {
+                    console.error('[GH Sync] Direct timeline persist failed', err);
+                } finally {
+                    runtime.isApplyingRemote = false;
+                }
+            }
+        }
+
+        applyTimelineChangeToRecords(hash ? String(hash) : '', safeTime, safeDuration, safePercent, now);
+        refreshCurrentResumeBar();
+        scheduleDebouncedSync(typeof syncDelayMs === 'number' ? syncDelayMs : CONFIG.PLAYBACK_SYNC_DEBOUNCE_MS);
+    }
+
+    function extractTimelinePayload(event) {
+        if (!event || typeof event !== 'object') {
+            return null;
+        }
+        const raw = event.data && typeof event.data === 'object' ? event.data : event;
+        if (!raw || !raw.hash) {
+            return null;
+        }
+        const road = raw.road && typeof raw.road === 'object' ? raw.road : raw;
+        return {
+            hash: String(raw.hash),
+            time: Math.max(0, Math.floor(Number(road.time) || 0)),
+            duration: Math.max(0, Math.floor(Number(road.duration) || 0)),
+            percent: Math.max(0, Math.min(100, Math.round(Number(road.percent) || 0)))
+        };
+    }
+
+    function handleTimelineRecordUpdate(rawEvent, syncDelayMs) {
+        if (runtime.isApplyingRemote) {
+            return;
+        }
+        const payload = extractTimelinePayload(rawEvent);
+        if (!payload) {
+            return;
+        }
+        if (runtime.playerSession.active && Date.now() - runtime.playerSession.startedAt < CONFIG.PLAYBACK_SETTLE_MS && payload.time < CONFIG.MIN_RESUME_SECONDS) {
+            return;
+        }
+        if (payload.time < CONFIG.MIN_RESUME_SECONDS && payload.percent === 0) {
+            return;
+        }
+
+        const now = Date.now();
+        updateLocalTimelineMeta(payload.hash, now);
+        runtime.lastFileViewSnapshot[payload.hash] = {
+            time: payload.time,
+            duration: payload.duration,
+            percent: computePercent(payload.time, payload.duration, payload.percent)
         };
 
-        applyTimelineChangeToResumes(hash, time, duration, percent, now);
+        applyTimelineChangeToRecords(
+            payload.hash,
+            payload.time,
+            payload.duration,
+            computePercent(payload.time, payload.duration, payload.percent),
+            now
+        );
         refreshCurrentResumeBar();
         scheduleDebouncedSync(typeof syncDelayMs === 'number' ? syncDelayMs : CONFIG.PLAYBACK_SYNC_DEBOUNCE_MS);
     }
@@ -1049,7 +1340,7 @@
         if (runtime.isApplyingRemote) {
             return false;
         }
-        const current = getSafeObjectStorage(STORAGE_KEYS.FILE_VIEW);
+        const current = readAggregatedLocalFileView();
         const prev = runtime.lastFileViewSnapshot || {};
         const now = Date.now();
         let hasChanges = false;
@@ -1069,7 +1360,7 @@
             }
             hasChanges = true;
             updateLocalTimelineMeta(hash, now);
-            applyTimelineChangeToResumes(hash, entry.time, entry.duration, entry.percent, now);
+            applyTimelineChangeToRecords(hash, entry.time, entry.duration, entry.percent, now);
         });
 
         runtime.lastFileViewSnapshot = cloneFileViewSnapshot(current);
@@ -1083,13 +1374,11 @@
         return hasChanges;
     }
 
-    function capturePlaybackContext(playData) {
+    function buildPlayContextFromPlayData(playData) {
         const descriptor = getActiveMovieDescriptor();
         if (!descriptor) {
-            runtime.activePlayContext = null;
-            return;
+            return null;
         }
-
         const root = getActiveRenderRoot();
         const domCtx = readCurrentDomContext(root);
         const parsedTitle = parseSeasonEpisodeFromText(playData.title || '');
@@ -1104,7 +1393,7 @@
         const timelineHash = String((playData.timeline && playData.timeline.hash) || playData.timeline_hash || playData.hash || '').trim();
         const episodeTitle = String(playData.title || '').trim();
 
-        runtime.activePlayContext = {
+        return {
             movieKey: descriptor.movieKey,
             mediaType: descriptor.mediaType,
             season: season,
@@ -1116,33 +1405,97 @@
             component: descriptor.component,
             timelineHash: timelineHash
         };
+    }
 
-        const existingLive = readLiveTimelineByHash(timelineHash);
-        const resumes = getSafeObjectStorage(STORAGE_KEYS.RESUMES);
-        const prevResume = normalizeResumeEntry(descriptor.movieKey, resumes[descriptor.movieKey]);
-        const isSameEpisode = Boolean(
-            prevResume &&
-            prevResume.season === season &&
-            prevResume.episode === episode &&
-            (!timelineHash || !prevResume.timelineHash || prevResume.timelineHash === timelineHash)
-        );
+    function findNewestSyncedPositionForContext(ctx) {
+        if (!ctx) {
+            return null;
+        }
+        const candidates = [];
+        const meta = getSafeObjectStorage(STORAGE_KEYS.META);
 
-        let initialTime = existingLive ? existingLive.time : 0;
-        let initialDuration = existingLive ? existingLive.duration : 0;
-        let initialPercent = existingLive ? existingLive.percent : 0;
-
-        if (initialTime < CONFIG.MIN_RESUME_SECONDS && isSameEpisode && prevResume.time >= CONFIG.MIN_RESUME_SECONDS) {
-            initialTime = prevResume.time;
-            initialDuration = prevResume.duration;
-            initialPercent = prevResume.percent;
+        const epKey = buildEpisodeKey(ctx.movieKey, ctx.season, ctx.episode);
+        if (epKey) {
+            const episodes = getSafeObjectStorage(STORAGE_KEYS.EPISODES);
+            const epEntry = normalizeEpisodeEntry(epKey, episodes[epKey]);
+            if (epEntry && epEntry.time >= CONFIG.MIN_RESUME_SECONDS) {
+                candidates.push(epEntry);
+            }
         }
 
-        saveLocalResume(Object.assign({}, runtime.activePlayContext, {
-            time: initialTime,
-            duration: initialDuration,
-            percent: initialPercent,
-            updatedAt: Date.now()
-        }));
+        const resumes = getSafeObjectStorage(STORAGE_KEYS.RESUMES);
+        const resumeEntry = normalizeResumeEntry(ctx.movieKey, resumes[ctx.movieKey]);
+        if (
+            resumeEntry &&
+            resumeEntry.time >= CONFIG.MIN_RESUME_SECONDS &&
+            resumeEntry.season === ctx.season &&
+            resumeEntry.episode === ctx.episode
+        ) {
+            candidates.push(resumeEntry);
+        }
+
+        if (ctx.timelineHash) {
+            const aggregated = readAggregatedLocalFileView();
+            const tlEntry = normalizeTimelineEntry(ctx.timelineHash, aggregated[ctx.timelineHash], meta[ctx.timelineHash]);
+            if (tlEntry && tlEntry.time >= CONFIG.MIN_RESUME_SECONDS) {
+                candidates.push(tlEntry);
+            }
+        }
+
+        if (candidates.length === 0) {
+            return null;
+        }
+
+        let best = candidates[0];
+        for (let i = 1; i < candidates.length; i++) {
+            best = pickNewerByTimestamp(best, candidates[i]);
+        }
+        return best;
+    }
+
+    function injectTimelineIntoPlayData(playData, targetHash, time, duration, percent) {
+        if (!playData || time < CONFIG.MIN_RESUME_SECONDS) {
+            return;
+        }
+        const safePercent = computePercent(time, duration, percent);
+        if (playData.timeline && typeof playData.timeline === 'object') {
+            if (targetHash) {
+                playData.timeline.hash = targetHash;
+            }
+            playData.timeline.time = time;
+            if (duration > 0) {
+                playData.timeline.duration = duration;
+            }
+            playData.timeline.percent = safePercent;
+        } else if (targetHash) {
+            playData.timeline = {
+                hash: targetHash,
+                time: time,
+                duration: duration,
+                percent: safePercent
+            };
+        }
+
+        if (targetHash) {
+            runtime.isApplyingRemote = true;
+            try {
+                const entry = {
+                    hash: targetHash,
+                    time: time,
+                    duration: duration,
+                    percent: safePercent
+                };
+                writeEntryToAllFileViewStores(entry);
+                const updateFn = runtime.originalTimelineUpdate || (Lampa.Timeline && typeof Lampa.Timeline.update === 'function' ? Lampa.Timeline.update.bind(Lampa.Timeline) : null);
+                if (updateFn) {
+                    updateFn(entry);
+                }
+            } catch (err) {
+                console.error('[GH Sync] Pre-play timeline inject failed', err);
+            } finally {
+                runtime.isApplyingRemote = false;
+            }
+        }
     }
 
     function wrapPlayDataTimelineHandler(playData) {
@@ -1189,6 +1542,16 @@
         Lampa.Timeline.update = wrappedUpdate;
     }
 
+    function resetPlayerSession() {
+        runtime.playerSession.active = true;
+        runtime.playerSession.startedAt = Date.now();
+        runtime.playerSession.lastTime = -1;
+        runtime.playerSession.lastDuration = 0;
+        runtime.playerSession.lastPersistedTime = -1;
+        runtime.playerSession.lastPersistAt = 0;
+        runtime.playerSession.hasValidPosition = false;
+    }
+
     function installPlayerPlayInterceptor() {
         if (!Lampa.Player || typeof Lampa.Player.play !== 'function') {
             return;
@@ -1196,6 +1559,10 @@
         const originalPlay = Lampa.Player.play.bind(Lampa.Player);
         Lampa.Player.play = function (playData) {
             if (playData && typeof playData === 'object') {
+                const ctx = buildPlayContextFromPlayData(playData);
+                runtime.activePlayContext = ctx;
+                resetPlayerSession();
+
                 const pending = runtime.pendingPlaybackTarget;
                 if (pending && Date.now() <= pending.expiresAt) {
                     runtime.pendingPlaybackTarget = null;
@@ -1205,48 +1572,114 @@
                             playData.url = playData.quality[matchedKey];
                         }
                     }
-                    if (pending.time >= CONFIG.MIN_RESUME_SECONDS) {
-                        const targetHash = String((playData.timeline && playData.timeline.hash) || pending.timelineHash || '').trim();
-                        if (targetHash) {
-                            if (playData.timeline && typeof playData.timeline === 'object') {
-                                playData.timeline.hash = targetHash;
-                                playData.timeline.time = pending.time;
-                                if (pending.duration > 0) {
-                                    playData.timeline.duration = pending.duration;
-                                }
-                                if (pending.percent > 0) {
-                                    playData.timeline.percent = pending.percent;
-                                }
-                            } else {
-                                playData.timeline = {
-                                    hash: targetHash,
-                                    time: pending.time,
-                                    duration: pending.duration,
-                                    percent: pending.percent
-                                };
-                            }
-                            runtime.isApplyingRemote = true;
-                            try {
-                                const updateFn = runtime.originalTimelineUpdate || (Lampa.Timeline && typeof Lampa.Timeline.update === 'function' ? Lampa.Timeline.update.bind(Lampa.Timeline) : null);
-                                if (updateFn) {
-                                    updateFn({
-                                        hash: targetHash,
-                                        time: pending.time,
-                                        duration: pending.duration,
-                                        percent: pending.percent
-                                    });
-                                }
-                            } finally {
-                                runtime.isApplyingRemote = false;
-                            }
+                    const targetHash = String((playData.timeline && playData.timeline.hash) || pending.timelineHash || '').trim();
+                    injectTimelineIntoPlayData(playData, targetHash, pending.time, pending.duration, pending.percent);
+                } else if (ctx) {
+                    const syncedBest = findNewestSyncedPositionForContext(ctx);
+                    if (syncedBest && syncedBest.time >= CONFIG.MIN_RESUME_SECONDS) {
+                        const targetHash = ctx.timelineHash || syncedBest.timelineHash || '';
+                        const meta = getSafeObjectStorage(STORAGE_KEYS.META);
+                        const localHashUpdatedAt = targetHash ? (Number(meta[targetHash]) || 0) : 0;
+                        if (syncedBest.updatedAt >= localHashUpdatedAt) {
+                            injectTimelineIntoPlayData(playData, targetHash, syncedBest.time, syncedBest.duration, syncedBest.percent);
                         }
                     }
                 }
+
                 wrapPlayDataTimelineHandler(playData);
-                capturePlaybackContext(playData);
             }
             return originalPlay(playData);
         };
+    }
+
+    function readVideoPosition(event) {
+        let current = event && typeof event.current === 'number' ? event.current : NaN;
+        let duration = event && typeof event.duration === 'number' ? event.duration : NaN;
+        if ((!isFinite(current) || !isFinite(duration)) && Lampa.PlayerVideo && typeof Lampa.PlayerVideo.video === 'function') {
+            const videoEl = Lampa.PlayerVideo.video();
+            if (videoEl) {
+                if (!isFinite(current)) {
+                    current = Number(videoEl.currentTime);
+                }
+                if (!isFinite(duration)) {
+                    duration = Number(videoEl.duration);
+                }
+            }
+        }
+        return {
+            time: isFinite(current) && current >= 0 ? Math.floor(current) : -1,
+            duration: isFinite(duration) && duration > 0 ? Math.floor(duration) : 0
+        };
+    }
+
+    function handlePlayerVideoProgress(event, forceImmediate) {
+        if (runtime.isApplyingRemote || !runtime.playerSession.active || !runtime.activePlayContext) {
+            return;
+        }
+        const pos = readVideoPosition(event);
+        if (pos.time < 0) {
+            return;
+        }
+
+        const now = Date.now();
+        const inSettleWindow = now - runtime.playerSession.startedAt < CONFIG.PLAYBACK_SETTLE_MS;
+        if (inSettleWindow && pos.time < CONFIG.MIN_RESUME_SECONDS) {
+            return;
+        }
+        if (pos.time < CONFIG.MIN_RESUME_SECONDS && !runtime.playerSession.hasValidPosition) {
+            return;
+        }
+
+        const previousTime = runtime.playerSession.lastTime;
+        runtime.playerSession.lastTime = pos.time;
+        if (pos.duration > 0) {
+            runtime.playerSession.lastDuration = pos.duration;
+        }
+        runtime.playerSession.hasValidPosition = true;
+
+        const isSeekJump = previousTime >= 0 && Math.abs(pos.time - previousTime) >= CONFIG.SEEK_JUMP_THRESHOLD_SEC;
+        const intervalElapsed = now - runtime.playerSession.lastPersistAt >= CONFIG.VIDEO_PERSIST_INTERVAL_MS;
+        const changedSincePersist = pos.time !== runtime.playerSession.lastPersistedTime;
+
+        if (!forceImmediate && !isSeekJump && !intervalElapsed) {
+            return;
+        }
+        if (!changedSincePersist && !forceImmediate) {
+            return;
+        }
+
+        runtime.playerSession.lastPersistedTime = pos.time;
+        runtime.playerSession.lastPersistAt = now;
+
+        const delay = forceImmediate ? CONFIG.IMMEDIATE_SYNC_DELAY_MS : CONFIG.PLAYBACK_SYNC_DEBOUNCE_MS;
+        persistPositionDirectly(
+            runtime.activePlayContext.timelineHash,
+            pos.time,
+            runtime.playerSession.lastDuration,
+            delay,
+            true
+        );
+    }
+
+    function flushPlayerSessionOnClose() {
+        const session = runtime.playerSession;
+        const ctx = runtime.activePlayContext;
+        if (session.active && session.hasValidPosition && session.lastTime >= CONFIG.MIN_RESUME_SECONDS && ctx) {
+            persistPositionDirectly(
+                ctx.timelineHash,
+                session.lastTime,
+                session.lastDuration,
+                CONFIG.IMMEDIATE_SYNC_DELAY_MS,
+                true
+            );
+        } else {
+            reconcileLocalFileViewDiff(true);
+            setTimeout(function () {
+                reconcileLocalFileViewDiff(true);
+            }, CONFIG.EXTERNAL_PLAYER_RECONCILE_DELAY_MS);
+        }
+        session.active = false;
+        setTimeout(refreshCurrentResumeBar, 350);
     }
 
     function stopOrchestrator() {
@@ -1551,18 +1984,18 @@
         if (!resume) {
             return;
         }
-        const hydrated = hydrateResumeWithLiveTimeline(resume);
+        const resolved = resolveLatestResumeView(resume);
         stopOrchestrator();
         runtime.orchestrator.active = true;
-        runtime.orchestrator.target = hydrated;
+        runtime.orchestrator.target = resolved;
         runtime.orchestrator.timerId = setTimeout(function () {
             abortOrchestrator('не удалось автоматически открыть серию');
         }, CONFIG.ORCHESTRATOR_TIMEOUT_MS);
 
-        const label = hydrated.mediaType === 'tv' && hydrated.episode > 0
-            ? 'S' + padEpisodeNumber(hydrated.season || 1) + 'E' + padEpisodeNumber(hydrated.episode)
+        const label = resolved.mediaType === 'tv' && resolved.episode > 0
+            ? 'S' + padEpisodeNumber(resolved.season || 1) + 'E' + padEpisodeNumber(resolved.episode)
             : 'Фильм';
-        Lampa.Noty.show('Продолжить: ' + label + ' (' + formatSeconds(hydrated.time) + ')');
+        Lampa.Noty.show('Продолжить: ' + label + ' (' + formatSeconds(resolved.time) + ')');
         advanceOrchestrator();
     }
 
@@ -1670,6 +2103,16 @@
         }
     }
 
+    function notifyTvNavigationCollection() {
+        if (runtime.orchestrator.active || !Lampa.Controller || typeof Lampa.Controller.enabled !== 'function') {
+            return;
+        }
+        const current = Lampa.Controller.enabled();
+        if (current && current.name === 'content' && typeof Lampa.Controller.toggle === 'function') {
+            Lampa.Controller.toggle('content');
+        }
+    }
+
     function refreshCurrentResumeBar() {
         const descriptor = getActiveMovieDescriptor();
         const root = getActiveRenderRoot();
@@ -1686,7 +2129,7 @@
 
         const resumes = getSafeObjectStorage(STORAGE_KEYS.RESUMES);
         const rawSaved = normalizeResumeEntry(descriptor.movieKey, resumes[descriptor.movieKey]);
-        const saved = rawSaved ? hydrateResumeWithLiveTimeline(rawSaved) : null;
+        const saved = rawSaved ? resolveLatestResumeView(rawSaved) : null;
 
         if (!saved || (saved.time < CONFIG.MIN_RESUME_SECONDS && saved.episode === 0)) {
             removeStrayBars(root, null);
@@ -1705,12 +2148,17 @@
             return;
         }
 
+        const hadExisting = Boolean(existingInTarget);
         removeStrayBars(root, null);
         if (firstCard) {
             targetContainer.insertBefore(nextBar, firstCard);
-            return;
+        } else {
+            targetContainer.insertBefore(nextBar, targetContainer.firstChild);
         }
-        targetContainer.insertBefore(nextBar, targetContainer.firstChild);
+
+        if (!hadExisting) {
+            notifyTvNavigationCollection();
+        }
     }
 
     function detachActiveObserver() {
@@ -1775,19 +2223,20 @@
             '.gh-resume-bar {',
             '  position: relative;',
             '  margin: 0.25em 0 0.85em 0;',
-            '  padding: 0.75em 1em 0.9em 1em;',
+            '  padding: 0.75em 1em 0.95em 1em;',
             '  border-radius: 0.7em;',
             '  background: rgba(255, 255, 255, 0.09);',
-            '  border: 2px solid rgba(255, 255, 255, 0.14);',
+            '  border: 0.14em solid rgba(255, 255, 255, 0.14);',
             '  cursor: pointer;',
             '  overflow: hidden;',
-            '  transition: background-color 0.18s ease, border-color 0.18s ease;',
+            '  transition: background-color 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;',
             '  box-sizing: border-box;',
             '  width: 100%;',
             '}',
             '.gh-resume-bar.focus, .gh-resume-bar:hover {',
-            '  background: rgba(255, 255, 255, 0.2);',
+            '  background: rgba(255, 255, 255, 0.22);',
             '  border-color: #ffffff;',
+            '  box-shadow: 0 0 0 0.12em rgba(255, 255, 255, 0.45);',
             '}',
             '.gh-resume-bar__main {',
             '  display: flex;',
@@ -1954,7 +2403,7 @@
         Lampa.SettingsApi.addParam({
             component: CONFIG.COMPONENT_ID,
             param: { name: STORAGE_KEYS.AUTO_SYNC, type: 'trigger', default: true },
-            field: { name: 'Автосинхронизация', description: 'Синхронизировать при запуске, возврате и остановке видео' }
+            field: { name: 'Автосинхронизация', description: 'Синхронизировать при запуске, перемотке и остановке видео' }
         });
 
         Lampa.SettingsApi.addParam({
@@ -1987,32 +2436,40 @@
         if (!hadLocalDiff) {
             triggerThrottledPullSync();
         }
-        setTimeout(refreshCurrentResumeBar, 300);
+        setTimeout(function () {
+            reconcileLocalFileViewDiff(true);
+            refreshCurrentResumeBar();
+        }, CONFIG.EXTERNAL_PLAYER_RECONCILE_DELAY_MS);
     }
 
     function bindLifecycleListeners() {
         if (Lampa.Timeline && Lampa.Timeline.listener) {
             Lampa.Timeline.listener.follow('update', function (event) {
-                const payload = event && event.data ? event.data : event;
-                if (payload && payload.hash) {
-                    handleTimelineRecordUpdate(payload, CONFIG.PLAYBACK_SYNC_DEBOUNCE_MS);
-                }
+                handleTimelineRecordUpdate(event, CONFIG.PLAYBACK_SYNC_DEBOUNCE_MS);
+            });
+        }
+
+        if (Lampa.PlayerVideo && Lampa.PlayerVideo.listener) {
+            Lampa.PlayerVideo.listener.follow('timeupdate', function (event) {
+                handlePlayerVideoProgress(event, false);
+            });
+            Lampa.PlayerVideo.listener.follow('pause', function (event) {
+                handlePlayerVideoProgress(event, true);
+            });
+            Lampa.PlayerVideo.listener.follow('ended', function (event) {
+                handlePlayerVideoProgress(event, true);
             });
         }
 
         if (Lampa.Player && Lampa.Player.listener) {
             Lampa.Player.listener.follow('destroy', function () {
-                const hadDiff = reconcileLocalFileViewDiff(false);
-                if (isAutoSyncEnabled() && getSyncCredentials().isValid) {
-                    scheduleDebouncedSync(hadDiff ? CONFIG.IMMEDIATE_SYNC_DELAY_MS : CONFIG.IMMEDIATE_SYNC_DELAY_MS);
-                }
-                setTimeout(refreshCurrentResumeBar, 350);
+                flushPlayerSessionOnClose();
             });
         }
 
         if (Lampa.Storage && Lampa.Storage.listener) {
             Lampa.Storage.listener.follow('change', function (event) {
-                if (runtime.isApplyingRemote || !event || event.name !== STORAGE_KEYS.FILE_VIEW) {
+                if (runtime.isApplyingRemote || !event || !isFileViewStorageKey(event.name)) {
                     return;
                 }
                 reconcileLocalFileViewDiff(true);
@@ -2043,7 +2500,7 @@
     }
 
     function initializePlugin() {
-        runtime.lastFileViewSnapshot = cloneFileViewSnapshot(getSafeObjectStorage(STORAGE_KEYS.FILE_VIEW));
+        runtime.lastFileViewSnapshot = cloneFileViewSnapshot(readAggregatedLocalFileView());
         injectStyles();
         registerSettingsUi();
         installTimelineUpdateInterceptor();
