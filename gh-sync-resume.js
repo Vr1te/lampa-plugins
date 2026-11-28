@@ -23,9 +23,14 @@
         ORCHESTRATOR_STEP_DELAY_MS: 450,
         PLAYBACK_ARM_TIMEOUT_MS: 20000,
         PLAYBACK_SETTLE_MS: 4000,
+        SWITCH_DEDUPE_MS: 800,
+        SAME_EPISODE_GUARD_MS: 1500,
+        SWITCH_MEDIA_GUARD_MS: 2500,
+        SWITCH_TIME_MATCH_TOLERANCE_SEC: 3,
         VIDEO_PERSIST_INTERVAL_MS: 5000,
         SEEK_JUMP_THRESHOLD_SEC: 4,
         MIN_RESUME_SECONDS: 3,
+        MIN_TITLE_MATCH_LENGTH: 3,
         BASE64_CHUNK_SIZE: 32768
     };
 
@@ -79,6 +84,10 @@
         mutationDebounceTimer: null,
         activePlayContext: null,
         pendingPlaybackTarget: null,
+        currentPlaylist: [],
+        domEpisodeCatalog: [],
+        lastHandledPlayItem: null,
+        lastHandledPlayAt: 0,
         playerSession: {
             active: false,
             startedAt: 0,
@@ -86,7 +95,11 @@
             lastDuration: 0,
             lastPersistedTime: -1,
             lastPersistAt: 0,
-            hasValidPosition: false
+            hasValidPosition: false,
+            awaitingNewMedia: false,
+            previousEpisodeLastTime: -1,
+            switchTimestamp: 0,
+            episodeSwitched: false
         },
         orchestrator: {
             active: false,
@@ -135,6 +148,15 @@
             .toLowerCase()
             .replace(/\s+/g, ' ')
             .trim();
+    }
+
+    function stripLeadingEpisodePrefix(value) {
+        return normalizeText(
+            String(value || '')
+                .replace(/^\s*(?:s\d{1,2}\s*e\d{1,3}|\d{1,2}\s*[xх]\s*\d{1,3})\s*[\.\-\:\—\–]?\s*/i, '')
+                .replace(/^\s*(?:серия|эпизод|episode|ep\.?)\s*\d{1,3}\s*[\.\-\:\—\–]?\s*/i, '')
+                .replace(/^\s*(?:№|#)?\s*0*\d{1,3}\s*[\.\-\)\:\—\–]\s*/, '')
+        );
     }
 
     function formatSeconds(totalSeconds) {
@@ -974,6 +996,32 @@
         return cards;
     }
 
+    function extractTitleFromEpisodeCard(card) {
+        if (!card) {
+            return '';
+        }
+        const titleNode = card.querySelector('.online-prestige__title, .online__title');
+        if (titleNode && titleNode.textContent) {
+            return titleNode.textContent.trim();
+        }
+        return String(card.textContent || '').trim();
+    }
+
+    function captureDomEpisodeCatalog(root) {
+        const cards = getEpisodeCards(root);
+        const catalog = [];
+        for (let i = 0; i < cards.length; i++) {
+            const title = extractTitleFromEpisodeCard(cards[i]);
+            catalog.push({
+                index: i,
+                episode: extractEpisodeNumberFromCard(cards[i]),
+                title: title,
+                normTitle: stripLeadingEpisodePrefix(title)
+            });
+        }
+        runtime.domEpisodeCatalog = catalog;
+    }
+
     function findFallbackEpisodeScrollBody(root) {
         if (!root) {
             return null;
@@ -1064,22 +1112,28 @@
         };
     }
 
-    function parseSeasonEpisodeFromText(text) {
+    function parseSeasonEpisodeFromText(text, allowLeadingNumber) {
         const str = String(text || '');
         let season = 0;
         let episode = 0;
 
-        const seMatch = str.match(/s(\d{1,2})\s*e(\d{1,3})/i);
+        const seMatch = str.match(/s(\d{1,2})\s*e(\d{1,3})/i) || str.match(/\b(\d{1,2})\s*[xх]\s*(\d{1,3})\b/i);
         if (seMatch) {
             return { season: Number(seMatch[1]) || 0, episode: Number(seMatch[2]) || 0 };
         }
-        const seasonMatch = str.match(/(?:сезон|season)\s*(\d{1,2})/i);
+        const seasonMatch = str.match(/(?:сезон|season)\s*(\d{1,2})/i) || str.match(/(\d{1,2})\s*(?:сезон|season)/i);
         if (seasonMatch) {
             season = Number(seasonMatch[1]) || 0;
         }
-        const episodeMatch = str.match(/(?:серия|эпизод|episode|ep\.?)\s*(\d{1,3})/i);
+        const episodeMatch = str.match(/(?:серия|эпизод|episode|ep\.?)\s*(\d{1,3})/i) || str.match(/(\d{1,3})\s*(?:серия|эпизод|episode)/i);
         if (episodeMatch) {
             episode = Number(episodeMatch[1]) || 0;
+        }
+        if (episode === 0 && allowLeadingNumber) {
+            const leadingMatch = str.match(/^\s*(?:№|#)?\s*0*(\d{1,3})(?:\s*[\.\-\)\:\—\–]|\s+(?![pр]\b))/) || str.match(/^\s*0*(\d{1,3})\s*$/);
+            if (leadingMatch) {
+                episode = Number(leadingMatch[1]) || 0;
+            }
         }
         return { season: season, episode: episode };
     }
@@ -1096,14 +1150,162 @@
             }
         }
         const trimmed = String(card.textContent || '').trim();
-        const parsed = parseSeasonEpisodeFromText(trimmed);
-        if (parsed.episode > 0) {
-            return parsed.episode;
+        const parsed = parseSeasonEpisodeFromText(trimmed, true);
+        return parsed.episode || 0;
+    }
+
+    function getActivePlaylist() {
+        if (Lampa.PlayerPlaylist && typeof Lampa.PlayerPlaylist.get === 'function') {
+            try {
+                const liveList = Lampa.PlayerPlaylist.get();
+                if (Array.isArray(liveList) && liveList.length > 0) {
+                    return liveList;
+                }
+            } catch (err) {
+                console.error('[GH Sync] PlayerPlaylist.get failed', err);
+            }
         }
-        const leadingMatch = trimmed.match(/^0*(\d{1,3})(?:\s|\.|\-|$)/);
-        if (leadingMatch) {
-            return Number(leadingMatch[1]) || 0;
+        return Array.isArray(runtime.currentPlaylist) ? runtime.currentPlaylist : [];
+    }
+
+    function getPlayItemTimelineHash(playData) {
+        if (!playData || typeof playData !== 'object') {
+            return '';
         }
+        return String((playData.timeline && playData.timeline.hash) || playData.timeline_hash || playData.hash || '').trim();
+    }
+
+    function readExplicitEpisodeNumber(item) {
+        if (!item || typeof item !== 'object') {
+            return 0;
+        }
+        const raw = item.episode || item.e || item.episode_number || item.ep || 0;
+        const num = Number(raw);
+        return isFinite(num) && num > 0 ? Math.floor(num) : 0;
+    }
+
+    function readExplicitSeasonNumber(item) {
+        if (!item || typeof item !== 'object') {
+            return 0;
+        }
+        const raw = item.season || item.s || item.season_number || 0;
+        const num = Number(raw);
+        return isFinite(num) && num > 0 ? Math.floor(num) : 0;
+    }
+
+    function findPlaylistIndexForItem(playlist, playData) {
+        if (!Array.isArray(playlist) || playlist.length === 0 || !playData || typeof playData !== 'object') {
+            return -1;
+        }
+        for (let i = 0; i < playlist.length; i++) {
+            if (playlist[i] === playData) {
+                return i;
+            }
+        }
+        const targetHash = getPlayItemTimelineHash(playData);
+        if (targetHash) {
+            for (let i = 0; i < playlist.length; i++) {
+                if (getPlayItemTimelineHash(playlist[i]) === targetHash) {
+                    return i;
+                }
+            }
+        }
+        if (typeof playData.url === 'string' && playData.url) {
+            for (let i = 0; i < playlist.length; i++) {
+                if (playlist[i] && playlist[i].url === playData.url) {
+                    return i;
+                }
+            }
+        }
+        const targetTitle = normalizeText(playData.title || playData.name || '');
+        if (targetTitle) {
+            for (let i = 0; i < playlist.length; i++) {
+                if (playlist[i] && normalizeText(playlist[i].title || playlist[i].name || '') === targetTitle) {
+                    return i;
+                }
+            }
+        }
+        return -1;
+    }
+
+    function matchEpisodeFromDomCatalogByTitle(rawTitle) {
+        const cleanTitle = stripLeadingEpisodePrefix(rawTitle);
+        if (!cleanTitle || cleanTitle.length < CONFIG.MIN_TITLE_MATCH_LENGTH) {
+            return 0;
+        }
+        const catalog = runtime.domEpisodeCatalog || [];
+        for (let i = 0; i < catalog.length; i++) {
+            if (catalog[i].episode > 0 && catalog[i].normTitle && catalog[i].normTitle === cleanTitle) {
+                return catalog[i].episode;
+            }
+        }
+        for (let i = 0; i < catalog.length; i++) {
+            const candidate = catalog[i].normTitle;
+            if (
+                catalog[i].episode > 0 &&
+                candidate &&
+                candidate.length >= CONFIG.MIN_TITLE_MATCH_LENGTH &&
+                (candidate.indexOf(cleanTitle) !== -1 || cleanTitle.indexOf(candidate) !== -1)
+            ) {
+                return catalog[i].episode;
+            }
+        }
+        return 0;
+    }
+
+    function resolveEpisodeNumberForPlayItem(playData, mediaType, playlist, isSwitch, root) {
+        const explicit = readExplicitEpisodeNumber(playData);
+        if (explicit > 0) {
+            return explicit;
+        }
+
+        const allowLeading = mediaType !== 'movie';
+        const titleCandidate = String(playData.title || playData.name || '').trim();
+        const parsedTitle = parseSeasonEpisodeFromText(titleCandidate, allowLeading);
+        if (parsedTitle.episode > 0) {
+            return parsedTitle.episode;
+        }
+
+        const catalogMatch = matchEpisodeFromDomCatalogByTitle(titleCandidate);
+        if (catalogMatch > 0) {
+            return catalogMatch;
+        }
+
+        const list = Array.isArray(playlist) ? playlist : [];
+        const playlistIdx = findPlaylistIndexForItem(list, playData);
+        if (playlistIdx >= 0) {
+            if (
+                runtime.domEpisodeCatalog.length === list.length &&
+                runtime.domEpisodeCatalog[playlistIdx] &&
+                runtime.domEpisodeCatalog[playlistIdx].episode > 0
+            ) {
+                return runtime.domEpisodeCatalog[playlistIdx].episode;
+            }
+            for (let i = 0; i < list.length; i++) {
+                const anchorEp = readExplicitEpisodeNumber(list[i]) || parseSeasonEpisodeFromText(list[i] && list[i].title, allowLeading).episode;
+                if (anchorEp > 0) {
+                    const inferred = anchorEp + (playlistIdx - i);
+                    if (inferred > 0) {
+                        return inferred;
+                    }
+                    break;
+                }
+            }
+            if (mediaType === 'tv' && list.length > 1) {
+                return playlistIdx + 1;
+            }
+        }
+
+        if (!isSwitch && root) {
+            const focusedCard = root.querySelector('.online-prestige.focus, .online.focus');
+            if (focusedCard && !isInsideSidebarOrFilter(focusedCard)) {
+                const focusedEp = extractEpisodeNumberFromCard(focusedCard);
+                if (focusedEp > 0) {
+                    return focusedEp;
+                }
+            }
+        }
+
         return 0;
     }
 
@@ -1148,6 +1350,19 @@
         const meta = getSafeObjectStorage(STORAGE_KEYS.META);
         meta[hash] = timestamp;
         Lampa.Storage.set(STORAGE_KEYS.META, meta);
+    }
+
+    function saveResumeEntryLocally(entry) {
+        if (!entry || !entry.movieKey) {
+            return;
+        }
+        const normalized = normalizeResumeEntry(entry.movieKey, entry);
+        if (!normalized) {
+            return;
+        }
+        const resumes = getSafeObjectStorage(STORAGE_KEYS.RESUMES);
+        resumes[normalized.movieKey] = normalized;
+        Lampa.Storage.set(STORAGE_KEYS.RESUMES, resumes);
     }
 
     function saveEpisodePosition(ctx, time, duration, percent, now) {
@@ -1282,7 +1497,9 @@
 
         applyTimelineChangeToRecords(hash ? String(hash) : '', safeTime, safeDuration, safePercent, now);
         refreshCurrentResumeBar();
-        scheduleDebouncedSync(typeof syncDelayMs === 'number' ? syncDelayMs : CONFIG.PLAYBACK_SYNC_DEBOUNCE_MS);
+        if (syncDelayMs !== null) {
+            scheduleDebouncedSync(typeof syncDelayMs === 'number' ? syncDelayMs : CONFIG.PLAYBACK_SYNC_DEBOUNCE_MS);
+        }
     }
 
     function extractTimelinePayload(event) {
@@ -1302,6 +1519,36 @@
         };
     }
 
+    function reconcileContextFromTimelineHash(hash) {
+        if (!hash) {
+            return;
+        }
+        const ctx = runtime.activePlayContext;
+        if (ctx && ctx.timelineHash === hash) {
+            return;
+        }
+        if (runtime.playerSession.awaitingNewMedia && (Date.now() - runtime.playerSession.switchTimestamp) < CONFIG.SWITCH_MEDIA_GUARD_MS) {
+            return;
+        }
+        const playlist = getActivePlaylist();
+        if (playlist.length === 0) {
+            return;
+        }
+        for (let i = 0; i < playlist.length; i++) {
+            if (getPlayItemTimelineHash(playlist[i]) === hash) {
+                const nextCtx = buildPlayContextFromPlayData(playlist[i], {
+                    isSwitch: true,
+                    previousCtx: ctx
+                });
+                if (nextCtx) {
+                    runtime.activePlayContext = nextCtx;
+                    runtime.playerSession.episodeSwitched = true;
+                }
+                return;
+            }
+        }
+    }
+
     function handleTimelineRecordUpdate(rawEvent, syncDelayMs) {
         if (runtime.isApplyingRemote) {
             return;
@@ -1317,21 +1564,18 @@
             return;
         }
 
+        reconcileContextFromTimelineHash(payload.hash);
+
         const now = Date.now();
+        const percent = computePercent(payload.time, payload.duration, payload.percent);
         updateLocalTimelineMeta(payload.hash, now);
         runtime.lastFileViewSnapshot[payload.hash] = {
             time: payload.time,
             duration: payload.duration,
-            percent: computePercent(payload.time, payload.duration, payload.percent)
+            percent: percent
         };
 
-        applyTimelineChangeToRecords(
-            payload.hash,
-            payload.time,
-            payload.duration,
-            computePercent(payload.time, payload.duration, payload.percent),
-            now
-        );
+        applyTimelineChangeToRecords(payload.hash, payload.time, payload.duration, percent, now);
         refreshCurrentResumeBar();
         scheduleDebouncedSync(typeof syncDelayMs === 'number' ? syncDelayMs : CONFIG.PLAYBACK_SYNC_DEBOUNCE_MS);
     }
@@ -1359,6 +1603,7 @@
                 return;
             }
             hasChanges = true;
+            reconcileContextFromTimelineHash(hash);
             updateLocalTimelineMeta(hash, now);
             applyTimelineChangeToRecords(hash, entry.time, entry.duration, entry.percent, now);
         });
@@ -1374,37 +1619,66 @@
         return hasChanges;
     }
 
-    function buildPlayContextFromPlayData(playData) {
+    function buildPlayContextFromPlayData(playData, options) {
+        const isSwitch = Boolean(options && options.isSwitch);
+        const prevCtx = options && options.previousCtx ? options.previousCtx : null;
         const descriptor = getActiveMovieDescriptor();
-        if (!descriptor) {
+
+        const movieKey = descriptor ? descriptor.movieKey : (prevCtx ? prevCtx.movieKey : '');
+        if (!movieKey) {
             return null;
         }
+        const mediaType = descriptor ? descriptor.mediaType : (prevCtx ? prevCtx.mediaType : 'tv');
+        const component = descriptor ? descriptor.component : (prevCtx ? prevCtx.component : '');
+
         const root = getActiveRenderRoot();
         const domCtx = readCurrentDomContext(root);
-        const parsedTitle = parseSeasonEpisodeFromText(playData.title || '');
-        const focusedCard = root ? root.querySelector('.online-prestige.focus, .online.focus') : null;
-        const focusedEp = focusedCard && !isInsideSidebarOrFilter(focusedCard) ? extractEpisodeNumberFromCard(focusedCard) : 0;
+        const playlist = getActivePlaylist();
+        const titleCandidate = String(playData.title || playData.name || '').trim();
+        const parsedTitle = parseSeasonEpisodeFromText(titleCandidate, mediaType !== 'movie');
 
-        const season = Number(playData.season || playData.s || parsedTitle.season || domCtx.season || 0);
-        const episode = Number(playData.episode || playData.e || parsedTitle.episode || focusedEp || 0);
-        const voice = String(playData.voice_name || playData.translate || playData.voice || domCtx.voice || '').trim();
-        const source = String(domCtx.source || Lampa.Storage.get('online_mod_balanser', '') || Lampa.Storage.get('online_balanser', '') || '').trim();
-        const quality = detectQualityLabel(playData);
-        const timelineHash = String((playData.timeline && playData.timeline.hash) || playData.timeline_hash || playData.hash || '').trim();
-        const episodeTitle = String(playData.title || '').trim();
+        const season = readExplicitSeasonNumber(playData) || parsedTitle.season || (prevCtx && prevCtx.season) || domCtx.season || 0;
+        const episode = resolveEpisodeNumberForPlayItem(playData, mediaType, playlist, isSwitch, root);
+        const voice = String(playData.voice_name || playData.translate || playData.voice || (prevCtx && prevCtx.voice) || domCtx.voice || '').trim();
+        const source = String(playData.balanser || domCtx.source || (prevCtx && prevCtx.source) || Lampa.Storage.get('online_mod_balanser', '') || Lampa.Storage.get('online_balanser', '') || '').trim();
+        const quality = detectQualityLabel(playData) || (prevCtx ? prevCtx.quality : '');
+        const timelineHash = getPlayItemTimelineHash(playData);
 
         return {
-            movieKey: descriptor.movieKey,
-            mediaType: descriptor.mediaType,
+            movieKey: movieKey,
+            mediaType: mediaType,
             season: season,
             episode: episode,
-            episodeTitle: episodeTitle,
+            episodeTitle: titleCandidate,
             source: source,
             voice: voice,
             quality: quality,
-            component: descriptor.component,
+            component: component,
             timelineHash: timelineHash
         };
+    }
+
+    function isSameEpisodePlayItem(prevCtx, playData) {
+        if (!prevCtx || !playData || typeof playData !== 'object') {
+            return false;
+        }
+        const nextHash = getPlayItemTimelineHash(playData);
+        if (prevCtx.timelineHash && nextHash) {
+            return prevCtx.timelineHash === nextHash;
+        }
+        const explicitEp = readExplicitEpisodeNumber(playData);
+        if (explicitEp > 0 && prevCtx.episode > 0) {
+            const explicitSeason = readExplicitSeasonNumber(playData);
+            if (explicitSeason > 0 && prevCtx.season > 0 && explicitSeason !== prevCtx.season) {
+                return false;
+            }
+            return explicitEp === prevCtx.episode;
+        }
+        const nextTitle = normalizeText(playData.title || playData.name || '');
+        if (prevCtx.episodeTitle && nextTitle) {
+            return normalizeText(prevCtx.episodeTitle) === nextTitle;
+        }
+        return false;
     }
 
     function findNewestSyncedPositionForContext(ctx) {
@@ -1506,7 +1780,7 @@
             return;
         }
         const originalHandler = playData.timeline.handler;
-        const hashForHandler = String(playData.timeline.hash || playData.timeline_hash || '').trim();
+        const hashForHandler = getPlayItemTimelineHash(playData);
         const wrappedHandler = function (percent, time, duration) {
             const result = originalHandler.apply(this, arguments);
             if (!runtime.isApplyingRemote && hashForHandler) {
@@ -1542,14 +1816,150 @@
         Lampa.Timeline.update = wrappedUpdate;
     }
 
-    function resetPlayerSession() {
+    function resetPlayerSession(options) {
+        const isSwitch = Boolean(options && options.isSwitch);
+        const prevLastTime = options && typeof options.previousEpisodeLastTime === 'number' ? options.previousEpisodeLastTime : -1;
+        const now = Date.now();
         runtime.playerSession.active = true;
-        runtime.playerSession.startedAt = Date.now();
+        runtime.playerSession.startedAt = now;
         runtime.playerSession.lastTime = -1;
         runtime.playerSession.lastDuration = 0;
         runtime.playerSession.lastPersistedTime = -1;
         runtime.playerSession.lastPersistAt = 0;
         runtime.playerSession.hasValidPosition = false;
+        runtime.playerSession.awaitingNewMedia = isSwitch;
+        runtime.playerSession.previousEpisodeLastTime = isSwitch ? prevLastTime : -1;
+        runtime.playerSession.switchTimestamp = isSwitch ? now : 0;
+        runtime.playerSession.episodeSwitched = isSwitch;
+    }
+
+    function flushPreviousEpisodeBeforeSwitch() {
+        const session = runtime.playerSession;
+        const prevCtx = runtime.activePlayContext;
+        const prevLastTime = session.lastTime;
+        if (session.active && session.hasValidPosition && session.lastTime >= CONFIG.MIN_RESUME_SECONDS && prevCtx) {
+            persistPositionDirectly(
+                prevCtx.timelineHash,
+                session.lastTime,
+                session.lastDuration,
+                null,
+                true
+            );
+        }
+        return prevLastTime;
+    }
+
+    function commitSwitchedEpisodeResume(ctx, knownPosition) {
+        if (!ctx) {
+            return;
+        }
+        const time = knownPosition && knownPosition.time >= CONFIG.MIN_RESUME_SECONDS ? knownPosition.time : 0;
+        const duration = knownPosition ? knownPosition.duration : 0;
+        const percent = knownPosition ? knownPosition.percent : 0;
+        saveResumeEntryLocally(Object.assign({}, ctx, {
+            time: time,
+            duration: duration,
+            percent: percent,
+            updatedAt: Date.now()
+        }));
+        refreshCurrentResumeBar();
+        scheduleDebouncedSync(CONFIG.PLAYBACK_SYNC_DEBOUNCE_MS);
+    }
+
+    function applyPlayDataActivation(playData, isSwitch) {
+        let prevLastTime = -1;
+        if (isSwitch) {
+            prevLastTime = flushPreviousEpisodeBeforeSwitch();
+        } else {
+            const root = getActiveRenderRoot();
+            captureDomEpisodeCatalog(root);
+            runtime.currentPlaylist = [];
+        }
+
+        const prevCtx = isSwitch ? runtime.activePlayContext : null;
+        const ctx = buildPlayContextFromPlayData(playData, {
+            isSwitch: isSwitch,
+            previousCtx: prevCtx
+        });
+        runtime.activePlayContext = ctx;
+        runtime.lastHandledPlayItem = playData;
+        runtime.lastHandledPlayAt = Date.now();
+        resetPlayerSession({
+            isSwitch: isSwitch,
+            previousEpisodeLastTime: prevLastTime
+        });
+
+        let knownPosition = null;
+        const pending = runtime.pendingPlaybackTarget;
+        if (!isSwitch && pending && Date.now() <= pending.expiresAt) {
+            runtime.pendingPlaybackTarget = null;
+            if (pending.quality && playData.quality && typeof playData.quality === 'object') {
+                const matchedKey = matchQualityKey(playData.quality, pending.quality);
+                if (matchedKey && playData.quality[matchedKey]) {
+                    playData.url = playData.quality[matchedKey];
+                }
+            }
+            const targetHash = getPlayItemTimelineHash(playData) || pending.timelineHash || '';
+            injectTimelineIntoPlayData(playData, targetHash, pending.time, pending.duration, pending.percent);
+        } else if (ctx) {
+            knownPosition = findNewestSyncedPositionForContext(ctx);
+            if (knownPosition && knownPosition.time >= CONFIG.MIN_RESUME_SECONDS) {
+                const targetHash = ctx.timelineHash || knownPosition.timelineHash || '';
+                const meta = getSafeObjectStorage(STORAGE_KEYS.META);
+                const localHashUpdatedAt = targetHash ? (Number(meta[targetHash]) || 0) : 0;
+                if (knownPosition.updatedAt >= localHashUpdatedAt) {
+                    injectTimelineIntoPlayData(playData, targetHash, knownPosition.time, knownPosition.duration, knownPosition.percent);
+                }
+            }
+        }
+
+        wrapPlayDataTimelineHandler(playData);
+
+        if (isSwitch && ctx) {
+            commitSwitchedEpisodeResume(ctx, knownPosition);
+        }
+    }
+
+    function extractPlayItemFromEvent(event) {
+        if (!event || typeof event !== 'object') {
+            return null;
+        }
+        if (event.item && typeof event.item === 'object') {
+            return event.item;
+        }
+        if (event.data && typeof event.data === 'object' && (event.data.url || event.data.title || event.data.timeline)) {
+            return event.data;
+        }
+        if (event.url || event.title || event.timeline || event.episode || event.e) {
+            return event;
+        }
+        return null;
+    }
+
+    function handleInPlayerEpisodeSwitch(playData) {
+        if (!playData || typeof playData !== 'object') {
+            return;
+        }
+        const now = Date.now();
+        if (playData === runtime.lastHandledPlayItem && (now - runtime.lastHandledPlayAt) < CONFIG.SWITCH_DEDUPE_MS) {
+            return;
+        }
+        if (
+            runtime.activePlayContext &&
+            isSameEpisodePlayItem(runtime.activePlayContext, playData) &&
+            (now - runtime.playerSession.startedAt) < CONFIG.SAME_EPISODE_GUARD_MS
+        ) {
+            runtime.lastHandledPlayItem = playData;
+            runtime.lastHandledPlayAt = now;
+            wrapPlayDataTimelineHandler(playData);
+            return;
+        }
+        const isSwitch = Boolean(runtime.playerSession.active && runtime.activePlayContext && !isSameEpisodePlayItem(runtime.activePlayContext, playData));
+        if (!isSwitch && runtime.activePlayContext && isSameEpisodePlayItem(runtime.activePlayContext, playData)) {
+            wrapPlayDataTimelineHandler(playData);
+            return;
+        }
+        applyPlayDataActivation(playData, isSwitch);
     }
 
     function installPlayerPlayInterceptor() {
@@ -1559,37 +1969,40 @@
         const originalPlay = Lampa.Player.play.bind(Lampa.Player);
         Lampa.Player.play = function (playData) {
             if (playData && typeof playData === 'object') {
-                const ctx = buildPlayContextFromPlayData(playData);
-                runtime.activePlayContext = ctx;
-                resetPlayerSession();
-
-                const pending = runtime.pendingPlaybackTarget;
-                if (pending && Date.now() <= pending.expiresAt) {
-                    runtime.pendingPlaybackTarget = null;
-                    if (pending.quality && playData.quality && typeof playData.quality === 'object') {
-                        const matchedKey = matchQualityKey(playData.quality, pending.quality);
-                        if (matchedKey && playData.quality[matchedKey]) {
-                            playData.url = playData.quality[matchedKey];
-                        }
-                    }
-                    const targetHash = String((playData.timeline && playData.timeline.hash) || pending.timelineHash || '').trim();
-                    injectTimelineIntoPlayData(playData, targetHash, pending.time, pending.duration, pending.percent);
-                } else if (ctx) {
-                    const syncedBest = findNewestSyncedPositionForContext(ctx);
-                    if (syncedBest && syncedBest.time >= CONFIG.MIN_RESUME_SECONDS) {
-                        const targetHash = ctx.timelineHash || syncedBest.timelineHash || '';
-                        const meta = getSafeObjectStorage(STORAGE_KEYS.META);
-                        const localHashUpdatedAt = targetHash ? (Number(meta[targetHash]) || 0) : 0;
-                        if (syncedBest.updatedAt >= localHashUpdatedAt) {
-                            injectTimelineIntoPlayData(playData, targetHash, syncedBest.time, syncedBest.duration, syncedBest.percent);
-                        }
-                    }
-                }
-
-                wrapPlayDataTimelineHandler(playData);
+                const isSwitch = Boolean(
+                    runtime.playerSession.active &&
+                    runtime.activePlayContext &&
+                    !isSameEpisodePlayItem(runtime.activePlayContext, playData)
+                );
+                applyPlayDataActivation(playData, isSwitch);
             }
             return originalPlay(playData);
         };
+
+        if (typeof Lampa.Player.playlist === 'function') {
+            const originalPlaylist = Lampa.Player.playlist.bind(Lampa.Player);
+            Lampa.Player.playlist = function (list) {
+                runtime.currentPlaylist = Array.isArray(list) ? list.slice() : [];
+                if (
+                    runtime.activePlayContext &&
+                    runtime.activePlayContext.episode === 0 &&
+                    runtime.lastHandledPlayItem &&
+                    runtime.currentPlaylist.length > 0
+                ) {
+                    const resolvedEp = resolveEpisodeNumberForPlayItem(
+                        runtime.lastHandledPlayItem,
+                        runtime.activePlayContext.mediaType,
+                        runtime.currentPlaylist,
+                        false,
+                        getActiveRenderRoot()
+                    );
+                    if (resolvedEp > 0) {
+                        runtime.activePlayContext.episode = resolvedEp;
+                    }
+                }
+                return originalPlaylist(list);
+            };
+        }
     }
 
     function readVideoPosition(event) {
@@ -1622,6 +2035,21 @@
         }
 
         const now = Date.now();
+        if (runtime.playerSession.awaitingNewMedia) {
+            const withinGuard = (now - runtime.playerSession.switchTimestamp) < CONFIG.SWITCH_MEDIA_GUARD_MS;
+            if (withinGuard && forceImmediate) {
+                return;
+            }
+            if (
+                withinGuard &&
+                runtime.playerSession.previousEpisodeLastTime >= CONFIG.MIN_RESUME_SECONDS &&
+                Math.abs(pos.time - runtime.playerSession.previousEpisodeLastTime) <= CONFIG.SWITCH_TIME_MATCH_TOLERANCE_SEC
+            ) {
+                return;
+            }
+            runtime.playerSession.awaitingNewMedia = false;
+        }
+
         const inSettleWindow = now - runtime.playerSession.startedAt < CONFIG.PLAYBACK_SETTLE_MS;
         if (inSettleWindow && pos.time < CONFIG.MIN_RESUME_SECONDS) {
             return;
@@ -1673,12 +2101,17 @@
                 true
             );
         } else {
-            reconcileLocalFileViewDiff(true);
+            const hadDiff = reconcileLocalFileViewDiff(true);
+            if (!hadDiff && session.episodeSwitched) {
+                scheduleDebouncedSync(CONFIG.IMMEDIATE_SYNC_DELAY_MS);
+            }
             setTimeout(function () {
                 reconcileLocalFileViewDiff(true);
             }, CONFIG.EXTERNAL_PLAYER_RECONCILE_DELAY_MS);
         }
         session.active = false;
+        session.awaitingNewMedia = false;
+        session.episodeSwitched = false;
         setTimeout(refreshCurrentResumeBar, 350);
     }
 
@@ -1889,7 +2322,7 @@
         }
 
         const targetEp = Number(resume.episode) || 0;
-        const targetTitleNorm = normalizeText(resume.episodeTitle);
+        const targetTitleNorm = stripLeadingEpisodePrefix(resume.episodeTitle);
 
         if (targetEp > 0) {
             for (let i = 0; i < candidates.length; i++) {
@@ -1899,7 +2332,7 @@
             }
         }
 
-        if (targetTitleNorm) {
+        if (targetTitleNorm && targetTitleNorm.length >= CONFIG.MIN_TITLE_MATCH_LENGTH) {
             for (let i = 0; i < candidates.length; i++) {
                 if (normalizeText(candidates[i].textContent).indexOf(targetTitleNorm) !== -1) {
                     return candidates[i];
@@ -2449,7 +2882,34 @@
             });
         }
 
+        if (Lampa.Player && Lampa.Player.listener) {
+            Lampa.Player.listener.follow('start', function (event) {
+                const item = extractPlayItemFromEvent(event);
+                if (item) {
+                    handleInPlayerEpisodeSwitch(item);
+                }
+            });
+            Lampa.Player.listener.follow('destroy', function () {
+                flushPlayerSessionOnClose();
+            });
+        }
+
+        if (Lampa.PlayerPlaylist && Lampa.PlayerPlaylist.listener) {
+            Lampa.PlayerPlaylist.listener.follow('select', function (event) {
+                const item = extractPlayItemFromEvent(event);
+                if (item) {
+                    handleInPlayerEpisodeSwitch(item);
+                }
+            });
+        }
+
         if (Lampa.PlayerVideo && Lampa.PlayerVideo.listener) {
+            Lampa.PlayerVideo.listener.follow('canplay', function () {
+                runtime.playerSession.awaitingNewMedia = false;
+            });
+            Lampa.PlayerVideo.listener.follow('loadeddata', function () {
+                runtime.playerSession.awaitingNewMedia = false;
+            });
             Lampa.PlayerVideo.listener.follow('timeupdate', function (event) {
                 handlePlayerVideoProgress(event, false);
             });
@@ -2458,12 +2918,6 @@
             });
             Lampa.PlayerVideo.listener.follow('ended', function (event) {
                 handlePlayerVideoProgress(event, true);
-            });
-        }
-
-        if (Lampa.Player && Lampa.Player.listener) {
-            Lampa.Player.listener.follow('destroy', function () {
-                flushPlayerSessionOnClose();
             });
         }
 
